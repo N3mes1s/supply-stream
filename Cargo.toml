@@ -1,0 +1,16 @@
+[package]
+name = "supply-stream"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = ["crates/supply-stream-core"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
+supply-stream-core = { path = "crates/supply-stream-core" }
+tokio = { version = "1.44", features = ["macros", "rt-multi-thread"] }

@@ -15,6 +15,10 @@ use crate::{
 };
 
 const DEFAULT_EDGE_WEIGHT: f64 = 1.0;
+const NPM_NAMESPACE_FARM_MIN_REVERSE_DEPENDENTS: usize = 25;
+const NPM_NAMESPACE_FARM_MAX_DIRECT_POPULARITY: f64 = 200.0;
+const NPM_NAMESPACE_FARM_MIN_DOMINANT_RATIO: f64 = 0.70;
+const NPM_NAMESPACE_FARM_MIN_PENALTY: f64 = 0.02;
 
 #[derive(Debug, Clone)]
 pub struct ScoreBuildConfig {
@@ -443,6 +447,8 @@ fn score_ecosystem(
         }
     }
 
+    apply_structural_guardrails(ecosystem, graph, &direct, &mut impact);
+
     let hidden = graph
         .packages
         .keys()
@@ -451,7 +457,7 @@ fn score_ecosystem(
             let impact_value = impact.get(package).copied().unwrap_or_default();
             (
                 package.clone(),
-                (impact_value + 1.0).ln() - (direct_value + 1.0).ln(),
+                ((impact_value + 1.0).ln() - (direct_value + 1.0).ln()).max(0.0),
             )
         })
         .collect::<HashMap<_, _>>();
@@ -491,6 +497,85 @@ fn score_ecosystem(
             }
         })
         .collect()
+}
+
+fn apply_structural_guardrails(
+    ecosystem: Ecosystem,
+    graph: &EcosystemGraph,
+    direct: &HashMap<String, f64>,
+    impact: &mut HashMap<String, f64>,
+) {
+    if ecosystem != Ecosystem::Npm {
+        return;
+    }
+
+    let reverse_dependents = build_reverse_dependents(graph);
+    for (package, dependents) in reverse_dependents {
+        let direct_popularity = direct.get(&package).copied().unwrap_or_default();
+        if direct_popularity > NPM_NAMESPACE_FARM_MAX_DIRECT_POPULARITY
+            || dependents.len() < NPM_NAMESPACE_FARM_MIN_REVERSE_DEPENDENTS
+        {
+            continue;
+        }
+
+        let Some(dominant_ratio) = dominant_npm_namespace_ratio(&dependents) else {
+            continue;
+        };
+        if dominant_ratio < NPM_NAMESPACE_FARM_MIN_DOMINANT_RATIO {
+            continue;
+        }
+
+        let popularity_factor =
+            (direct_popularity / NPM_NAMESPACE_FARM_MAX_DIRECT_POPULARITY).clamp(0.0, 1.0);
+        let concentration_factor = (1.0
+            - (dominant_ratio - NPM_NAMESPACE_FARM_MIN_DOMINANT_RATIO)
+                / (1.0 - NPM_NAMESPACE_FARM_MIN_DOMINANT_RATIO))
+            .clamp(0.0, 1.0);
+        let penalty =
+            (popularity_factor * concentration_factor).clamp(NPM_NAMESPACE_FARM_MIN_PENALTY, 1.0);
+        if penalty >= 1.0 {
+            continue;
+        }
+
+        if let Some(current) = impact.get_mut(&package) {
+            *current *= penalty;
+        }
+    }
+}
+
+fn build_reverse_dependents(graph: &EcosystemGraph) -> HashMap<String, Vec<String>> {
+    let mut reverse = HashMap::<String, Vec<String>>::new();
+    for (package, dependencies) in &graph.dependency_weights {
+        for dependency in dependencies.keys() {
+            reverse
+                .entry(dependency.clone())
+                .or_default()
+                .push(package.clone());
+        }
+    }
+    reverse
+}
+
+fn dominant_npm_namespace_ratio(dependents: &[String]) -> Option<f64> {
+    let mut namespaces = HashMap::<String, usize>::new();
+    for dependent in dependents {
+        let Some(namespace) = npm_namespace(dependent) else {
+            continue;
+        };
+        *namespaces.entry(namespace).or_default() += 1;
+    }
+    let dominant = namespaces.into_values().max()?;
+    Some(dominant as f64 / dependents.len() as f64)
+}
+
+fn npm_namespace(package: &str) -> Option<String> {
+    let base = package.split('>').next().unwrap_or(package).trim();
+    if !base.starts_with('@') {
+        return None;
+    }
+    let mut segments = base.split('/');
+    let scope = segments.next()?;
+    Some(scope.to_string())
 }
 
 fn count_priorities(scores: &[PriorityScoreRecord]) -> PriorityCounts {
@@ -749,5 +834,84 @@ mod tests {
             ]
         );
         assert_eq!(confidence, Some(1.0));
+    }
+
+    #[test]
+    fn scoring_penalizes_low_popularity_npm_namespace_farms() {
+        let mut input = String::from(
+            r#"
+{"type":"package","ecosystem":"npm","package":"legit-core","direct_popularity":1000}
+{"type":"package","ecosystem":"npm","package":"farm-core","direct_popularity":80}
+"#,
+        );
+        for index in 0..40 {
+            input.push_str(&format!(
+                "{{\"type\":\"package\",\"ecosystem\":\"npm\",\"package\":\"@farm/pkg-{index}\",\"direct_popularity\":82}}\n"
+            ));
+            input.push_str(&format!(
+                "{{\"type\":\"dependency\",\"ecosystem\":\"npm\",\"package\":\"@farm/pkg-{index}\",\"dependency\":\"farm-core\",\"weight\":1.0}}\n"
+            ));
+        }
+
+        let (scores, _) = build_priority_scores_from_ndjson(
+            &input,
+            &ScoreBuildConfig {
+                alpha: 0.85,
+                max_iterations: 64,
+                epsilon: 1e-9,
+                high_quantile: 0.99,
+                medium_quantile: 0.9,
+                score_source_version: None,
+            },
+        )
+        .unwrap();
+
+        let by_name = scores
+            .into_iter()
+            .map(|score| (score.package.clone(), score))
+            .collect::<HashMap<_, _>>();
+
+        let legit = by_name.get("legit-core").unwrap();
+        let farm = by_name.get("farm-core").unwrap();
+        assert!(legit.propagated_impact.unwrap() > farm.propagated_impact.unwrap());
+    }
+
+    #[test]
+    fn scoring_preserves_diversified_high_popularity_npm_hubs() {
+        let mut input = String::from(
+            r#"
+{"type":"package","ecosystem":"npm","package":"hub-core","direct_popularity":1000}
+"#,
+        );
+        for index in 0..30 {
+            input.push_str(&format!(
+                "{{\"type\":\"package\",\"ecosystem\":\"npm\",\"package\":\"@scope-{index}/pkg\",\"direct_popularity\":90}}\n"
+            ));
+            input.push_str(&format!(
+                "{{\"type\":\"dependency\",\"ecosystem\":\"npm\",\"package\":\"@scope-{index}/pkg\",\"dependency\":\"hub-core\",\"weight\":1.0}}\n"
+            ));
+        }
+
+        let (scores, _) = build_priority_scores_from_ndjson(
+            &input,
+            &ScoreBuildConfig {
+                alpha: 0.85,
+                max_iterations: 64,
+                epsilon: 1e-9,
+                high_quantile: 0.99,
+                medium_quantile: 0.9,
+                score_source_version: None,
+            },
+        )
+        .unwrap();
+
+        let by_name = scores
+            .into_iter()
+            .map(|score| (score.package.clone(), score))
+            .collect::<HashMap<_, _>>();
+
+        let hub = by_name.get("hub-core").unwrap();
+        assert!(hub.propagated_impact.unwrap() > 1000.0);
+        assert!(hub.hidden_leverage.unwrap() > 0.0);
     }
 }

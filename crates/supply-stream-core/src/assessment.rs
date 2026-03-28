@@ -239,7 +239,7 @@ impl From<&StoredReleaseDiff> for DiffAssessmentInput {
     }
 }
 
-fn is_package_manifest_only(
+pub(crate) fn is_package_manifest_only(
     files_added: &[String],
     files_removed: &[String],
     files_changed: &[String],

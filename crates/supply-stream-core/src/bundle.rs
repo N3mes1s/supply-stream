@@ -7,7 +7,7 @@ use serde_json::Value;
 use tokio::fs;
 
 use crate::{
-    assessment::{DiffAssessmentInput, assess_release},
+    assessment::{DiffAssessmentInput, assess_release, is_package_manifest_only},
     capture::CapturedRelease,
     event::{
         EmittedGraphEvidence, EmittedPackageReleaseEvent, EmittedReleaseAssessmentSignal,
@@ -154,6 +154,39 @@ fn diff_assessment_input_from_value(value: &Value) -> Option<DiffAssessmentInput
         .and_then(Value::as_str)
         .map(str::to_string);
     let content = value.get("diff").and_then(|value| value.get("content"));
+    let files_added = content
+        .and_then(|value| value.get("files_added"))
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let files_removed = content
+        .and_then(|value| value.get("files_removed"))
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let files_changed = content
+        .and_then(|value| value.get("files_changed"))
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     Some(DiffAssessmentInput {
         status,
         baseline_version,
@@ -180,54 +213,11 @@ fn diff_assessment_input_from_value(value: &Value) -> Option<DiffAssessmentInput
             .and_then(Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())
             .unwrap_or(0),
-        package_manifest_only: content
-            .and_then(|value| value.get("files_added"))
-            .and_then(Value::as_array)
-            .zip(
-                content
-                    .and_then(|value| value.get("files_removed"))
-                    .and_then(Value::as_array),
-            )
-            .zip(
-                content
-                    .and_then(|value| value.get("files_changed"))
-                    .and_then(Value::as_array),
-            )
-            .map(|((added, removed), changed)| {
-                let added: Vec<String> = added
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect();
-                let removed: Vec<String> = removed
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect();
-                let changed: Vec<String> = changed
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect();
-                added.is_empty()
-                    && removed.is_empty()
-                    && !changed.is_empty()
-                    && changed.iter().all(|path| {
-                        matches!(
-                            path.as_str(),
-                            "package.json"
-                                | "Cargo.toml"
-                                | "pyproject.toml"
-                                | "setup.py"
-                                | "setup.cfg"
-                        ) || path.ends_with("/package.json")
-                            || path.ends_with("/Cargo.toml")
-                            || path.ends_with("/pyproject.toml")
-                            || path.ends_with("/setup.py")
-                            || path.ends_with("/setup.cfg")
-                    })
-            })
-            .unwrap_or(false),
+        package_manifest_only: is_package_manifest_only(
+            &files_added,
+            &files_removed,
+            &files_changed,
+        ),
     })
 }
 
@@ -370,5 +360,26 @@ mod tests {
         assert!(bundle.release_assessment.is_some());
         assert!(bundle.event.graph.known_in_local_graph);
         Ok(())
+    }
+
+    #[test]
+    fn diff_value_treats_missing_added_removed_arrays_as_empty_for_manifest_only() {
+        let value = serde_json::json!({
+            "status": "ready",
+            "baseline_version": "2.0.5",
+            "diff": {
+                "content": {
+                    "available": true,
+                    "patches_included": false,
+                    "files_added_count": 0,
+                    "files_removed_count": 0,
+                    "files_changed_count": 1,
+                    "files_changed": ["package.json"]
+                }
+            }
+        });
+
+        let input = diff_assessment_input_from_value(&value).expect("diff input");
+        assert!(input.package_manifest_only);
     }
 }

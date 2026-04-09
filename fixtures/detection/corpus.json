@@ -1,0 +1,95 @@
+{
+  "fixtures": [
+    {
+      "id": "winston_prism",
+      "ecosystem": "npm",
+      "package": "winston-prism",
+      "version": "1.0.1",
+      "format": "npm_tgz",
+      "fixture_dir": "winston-prism",
+      "expected_verdict_class": "malware",
+      "expected_max_severity": "high",
+      "required_rules": ["npm_runtime_encoded_remote_loader"],
+      "required_behavior_tags": ["remote_fetch", "dynamic_execution"],
+      "details": {
+        "main": "lib/winston_prisma.js"
+      }
+    },
+    {
+      "id": "strapi_plugin_events",
+      "ecosystem": "npm",
+      "package": "strapi-plugin-events",
+      "version": "3.6.8",
+      "format": "npm_tgz",
+      "fixture_dir": "strapi-plugin-events",
+      "expected_verdict_class": "malware",
+      "expected_max_severity": "high",
+      "required_rules": [
+        "npm_install_multiphase_secrets_exfil_agent",
+        "npm_install_secrets_harvesting_c2_agent"
+      ],
+      "required_behavior_tags": ["exfiltration", "command_and_control", "install_or_build_execution"],
+      "details": {
+        "has_install_scripts": true
+      }
+    },
+    {
+      "id": "strapi_plugin_api",
+      "ecosystem": "npm",
+      "package": "strapi-plugin-api",
+      "version": "3.6.8",
+      "format": "npm_tgz",
+      "fixture_dir": "strapi-plugin-api",
+      "expected_verdict_class": "malware",
+      "expected_max_severity": "high",
+      "required_rules": [
+        "npm_install_multiphase_secrets_exfil_agent",
+        "npm_install_persistent_shell_backdoor"
+      ],
+      "required_behavior_tags": ["command_and_control", "persistence_or_propagation", "shell_execution"],
+      "details": {
+        "has_install_scripts": true
+      }
+    },
+    {
+      "id": "modular_prompt_driver",
+      "ecosystem": "npm",
+      "package": "@modular-prompt/driver",
+      "version": "0.11.2",
+      "format": "npm_tgz",
+      "fixture_dir": "modular-prompt-driver",
+      "expected_verdict_class": "risky_installer",
+      "expected_max_severity": "warning",
+      "required_rules": ["npm_downloader_pipe_to_shell_installer"],
+      "required_behavior_tags": ["install_or_build_execution", "remote_fetch"],
+      "details": {
+        "has_install_scripts": true
+      }
+    },
+    {
+      "id": "codemap_cli",
+      "ecosystem": "npm",
+      "package": "@gingerdev/codemap-cli",
+      "version": "0.2.3",
+      "format": "npm_tgz",
+      "fixture_dir": "codemap-cli",
+      "expected_verdict_class": "invasive_tooling",
+      "expected_max_severity": "warning",
+      "required_rules": ["npm_mcp_server_injection"],
+      "required_behavior_tags": ["target_mutation"],
+      "details": {
+        "main": "dist/init.js"
+      }
+    },
+    {
+      "id": "anikoto_like",
+      "ecosystem": "pypi",
+      "package": "anikoto",
+      "version": "3.6.0",
+      "format": "pypi_wheel",
+      "fixture_dir": "anikoto-like",
+      "expected_verdict_class": "clean",
+      "expected_max_severity": "informational"
+    }
+  ]
+}

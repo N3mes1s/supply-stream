@@ -1,0 +1,7 @@
+{
+  "name": "strapi-plugin-events",
+  "version": "3.6.8",
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  }
+}

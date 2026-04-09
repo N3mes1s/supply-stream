@@ -1,8 +1,11 @@
 use crate::{
-    capture::{CapturedRelease, ReleaseStatus},
+    capture::{CapturedRelease, ReleaseStatus, captured_metadata_risk},
+    content_risk::{ContentRiskMatch, ContentRiskSignal, captured_content_risk},
+    detection::{emitted_rule_evidence, rule_behavior_profile},
     diff::StoredReleaseDiff,
     event::{
-        EmittedDiffEvidence, EmittedGraphEvidence, PackageReleaseEvent, ReleaseAssessmentSeverity,
+        DetectionMatchClass, EmittedDiffEvidence, EmittedGraphEvidence, EmittedMatchedRuleEvidence,
+        PackageReleaseEvent, ReleaseAssessmentSeverity, ReleaseVerdictClass,
     },
     repo_provenance::RepositoryReleaseProvenance,
     store::GraphEvidence,
@@ -18,13 +21,20 @@ pub struct DiffAssessmentInput {
     pub files_removed_count: usize,
     pub files_changed_count: usize,
     pub package_manifest_only: bool,
+    pub target_has_install_scripts: Option<bool>,
+    pub install_scripts_longstanding: Option<bool>,
+    pub install_hook_changed: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ReleaseAssessment {
     pub suspicious: bool,
     pub severity: ReleaseAssessmentSeverity,
+    pub verdict_class: ReleaseVerdictClass,
     pub factors: Vec<String>,
+    pub behavior_tags: Vec<String>,
+    pub matched_rules: Vec<String>,
+    pub matched_evidence: Vec<EmittedMatchedRuleEvidence>,
     pub reason: String,
     pub graph: EmittedGraphEvidence,
     pub diff: Option<EmittedDiffEvidence>,
@@ -41,13 +51,19 @@ pub fn assess_release(
     let diff = emitted_diff_evidence(stored_diff);
 
     let prerelease = is_prerelease_version(&event.version);
-    let install_time_execution = capture_has_install_time_execution(capture);
-    let install_time_execution_longstanding =
-        capture_has_longstanding_install_time_execution(capture);
+    let install_time_execution = stored_diff
+        .and_then(|diff| diff.target_has_install_scripts)
+        .unwrap_or_else(|| capture_has_install_time_execution(capture));
+    let install_time_execution_longstanding = stored_diff
+        .and_then(|diff| diff.install_scripts_longstanding)
+        .unwrap_or_else(|| capture_has_longstanding_install_time_execution(capture));
+    let install_hook_changed = stored_diff
+        .and_then(|diff| diff.install_hook_changed)
+        .unwrap_or(false);
     let install_time_execution_benign = capture_has_benign_install_time_execution(capture);
     let risky_install_time_execution = install_time_execution
-        && !install_time_execution_longstanding
-        && !install_time_execution_benign;
+        && !install_time_execution_benign
+        && (!install_time_execution_longstanding || install_hook_changed);
     let medium_or_high_impact = matches!(
         event.priority_snapshot().tier,
         crate::priority::PriorityTier::Medium | crate::priority::PriorityTier::High
@@ -58,6 +74,9 @@ pub fn assess_release(
         capture.status,
         ReleaseStatus::Removed | ReleaseStatus::Yanked
     );
+    let metadata_risk = captured_metadata_risk(capture);
+    let content_risk = captured_content_risk(capture);
+    let content_summary = summarize_content_matches(&content_risk);
 
     let mut factors = Vec::new();
     if repo_mismatch {
@@ -77,6 +96,9 @@ pub fn assess_release(
     if install_time_execution_benign {
         factors.push("install_time_execution_benign".to_string());
     }
+    if install_hook_changed {
+        factors.push("install_hook_changed".to_string());
+    }
     if medium_or_high_impact {
         factors.push("high_or_medium_impact".to_string());
     }
@@ -85,6 +107,17 @@ pub fn assess_release(
     }
     if removed_or_yanked {
         factors.push("removed_or_yanked".to_string());
+    }
+    if metadata_risk.suspicious {
+        factors.push("malware_shaped_metadata".to_string());
+        factors.extend(metadata_risk.factors.clone());
+    }
+    if content_risk.suspicious {
+        factors.push("malware_shaped_content".to_string());
+        factors.extend(content_risk.factors.clone());
+    }
+    if !content_risk.iocs.is_empty() {
+        factors.push("content_iocs_present".to_string());
     }
 
     let content_changed = diff.as_ref().is_some_and(|diff| {
@@ -105,61 +138,91 @@ pub fn assess_release(
         factors.push("package_manifest_only".to_string());
     }
 
-    let (severity, suspicious, reason) = if repo_mismatch
-        && (risky_install_time_execution
-            || (!prerelease && (medium_or_high_impact || reverse_dependents_present)))
-        && content_changed
-        && !package_manifest_only
-    {
+    let (severity, verdict_class, suspicious, reason) = if content_summary.confident_malware {
         (
             ReleaseAssessmentSeverity::High,
+            ReleaseVerdictClass::Malware,
             true,
-            "repository mismatch combined with impactful release and concrete content changes"
-                .to_string(),
+            content_risk.reason.clone(),
         )
-    } else if repo_mismatch && risky_install_time_execution {
-        (
-            ReleaseAssessmentSeverity::High,
-            true,
-            "repository mismatch combined with install-time execution".to_string(),
-        )
-    } else if repo_mismatch && !prerelease && (medium_or_high_impact || reverse_dependents_present)
-    {
+    } else if content_summary.has_malicious_behavior {
         (
             ReleaseAssessmentSeverity::Warning,
+            ReleaseVerdictClass::SuspiciousUnknown,
             true,
-            "stable upstream mismatch on a package with observable downstream impact".to_string(),
+            format!(
+                "content matched malicious behavior heuristics without a confident behavior chain [{}]",
+                content_summary.matched_rules.join(", ")
+            ),
         )
-    } else if repo_mismatch && !prerelease && content_changed {
+    } else if content_summary.has_risky_installer || risky_install_time_execution {
         (
             ReleaseAssessmentSeverity::Warning,
+            ReleaseVerdictClass::RiskyInstaller,
             true,
-            "stable upstream mismatch with concrete content changes".to_string(),
+            if content_summary.has_risky_installer {
+                content_risk.reason.clone()
+            } else {
+                "repository mismatch combined with install-time execution".to_string()
+            },
         )
-    } else if install_time_execution
+    } else if content_summary.has_invasive_tooling {
+        (
+            ReleaseAssessmentSeverity::Warning,
+            ReleaseVerdictClass::InvasiveTooling,
+            true,
+            content_risk.reason.clone(),
+        )
+    } else if metadata_risk.suspicious {
+        (
+            ReleaseAssessmentSeverity::Warning,
+            ReleaseVerdictClass::SuspiciousUnknown,
+            true,
+            metadata_risk.reason.clone(),
+        )
+    } else if removed_or_yanked
         && content_changed
         && (medium_or_high_impact || reverse_dependents_present)
     {
         (
             ReleaseAssessmentSeverity::Warning,
+            ReleaseVerdictClass::SuspiciousUnknown,
             true,
-            "install-time execution combined with impact and content changes".to_string(),
+            "removed or yanked release with content changes and downstream impact".to_string(),
+        )
+    } else if repo_mismatch && !prerelease && content_changed && !package_manifest_only {
+        (
+            ReleaseAssessmentSeverity::Informational,
+            ReleaseVerdictClass::Clean,
+            false,
+            "repository mismatch observed with concrete content changes but no additional corroborating security signals".to_string(),
         )
     } else if content_large && (medium_or_high_impact || reverse_dependents_present) {
         (
             ReleaseAssessmentSeverity::Warning,
+            ReleaseVerdictClass::SuspiciousUnknown,
             true,
             "large content churn on a package with observable downstream impact".to_string(),
+        )
+    } else if repo_mismatch && !prerelease && (medium_or_high_impact || reverse_dependents_present)
+    {
+        (
+            ReleaseAssessmentSeverity::Informational,
+            ReleaseVerdictClass::Clean,
+            false,
+            "stable upstream mismatch on a package with observable downstream impact".to_string(),
         )
     } else if repo_mismatch {
         (
             ReleaseAssessmentSeverity::Informational,
+            ReleaseVerdictClass::Clean,
             false,
             "repository mismatch observed without additional corroborating signals".to_string(),
         )
     } else {
         (
             ReleaseAssessmentSeverity::Informational,
+            ReleaseVerdictClass::Clean,
             false,
             "no corroborating multi-signal release risk factors observed".to_string(),
         )
@@ -168,10 +231,123 @@ pub fn assess_release(
     ReleaseAssessment {
         suspicious,
         severity,
+        verdict_class,
         factors,
+        behavior_tags: content_summary.behavior_tags,
+        matched_rules: content_summary.matched_rules,
+        matched_evidence: content_summary.matched_evidence,
         reason,
         graph,
         diff,
+    }
+}
+
+#[derive(Default)]
+struct ContentMatchSummary {
+    matched_rules: Vec<String>,
+    behavior_tags: Vec<String>,
+    matched_evidence: Vec<EmittedMatchedRuleEvidence>,
+    has_malicious_behavior: bool,
+    has_risky_installer: bool,
+    has_invasive_tooling: bool,
+    confident_malware: bool,
+}
+
+fn summarize_content_matches(content_risk: &ContentRiskSignal) -> ContentMatchSummary {
+    let mut summary = ContentMatchSummary::default();
+    let mut matched_rules = std::collections::BTreeSet::new();
+    let mut behavior_tags = std::collections::BTreeSet::new();
+    let mut malicious_groups = std::collections::BTreeSet::new();
+    let mut malicious_behavior_tags = std::collections::BTreeSet::new();
+    let mut malicious_match_count = 0usize;
+    let mut strong_chain_count = 0usize;
+    let mut has_concrete_malicious_evidence = false;
+
+    for matched in &content_risk.matches {
+        let profile = rule_behavior_profile(&matched.rule_id, &matched.tags);
+        let match_class = matched.match_class.unwrap_or(profile.match_class);
+        let matched_behavior_tags = if matched.behavior_tags.is_empty() {
+            profile.behavior_tags.clone()
+        } else {
+            matched.behavior_tags.clone()
+        };
+
+        matched_rules.insert(matched.rule_id.clone());
+        for behavior_tag in &matched_behavior_tags {
+            behavior_tags.insert(behavior_tag.clone());
+        }
+        summary
+            .matched_evidence
+            .push(emitted_rule_evidence_from_match(
+                matched,
+                match_class,
+                &matched_behavior_tags,
+            ));
+
+        match match_class {
+            DetectionMatchClass::MaliciousBehavior => {
+                summary.has_malicious_behavior = true;
+                malicious_match_count += 1;
+                if matched.evidence_kind.as_deref() != Some("module_condition") {
+                    has_concrete_malicious_evidence = true;
+                }
+                if profile.strong_malicious_chain {
+                    strong_chain_count += 1;
+                }
+                for behavior_tag in &matched_behavior_tags {
+                    malicious_behavior_tags.insert(behavior_tag.clone());
+                    malicious_groups.insert(behavior_group(behavior_tag).to_string());
+                }
+            }
+            DetectionMatchClass::RiskyInstaller => summary.has_risky_installer = true,
+            DetectionMatchClass::InvasiveTooling => summary.has_invasive_tooling = true,
+            DetectionMatchClass::ContextOnly => {}
+        }
+    }
+
+    let has_iocs = !content_risk.iocs.is_empty();
+    let strong_chain_is_self_sufficient = strong_chain_count > 0
+        && (malicious_groups.len() >= 2 || malicious_behavior_tags.len() >= 2);
+    let corroborated_malicious_signal = has_concrete_malicious_evidence || has_iocs;
+
+    summary.confident_malware = strong_chain_count > 0
+        && (corroborated_malicious_signal || strong_chain_is_self_sufficient)
+        || malicious_groups.len() >= 2
+            && corroborated_malicious_signal
+            && malicious_match_count >= 2;
+    summary.matched_rules = matched_rules.into_iter().collect();
+    summary.behavior_tags = behavior_tags.into_iter().collect();
+    summary.matched_evidence.sort_by(|left, right| {
+        left.rule_id
+            .cmp(&right.rule_id)
+            .then(left.file_path.cmp(&right.file_path))
+    });
+    summary
+}
+
+fn emitted_rule_evidence_from_match(
+    matched: &ContentRiskMatch,
+    match_class: DetectionMatchClass,
+    behavior_tags: &[String],
+) -> EmittedMatchedRuleEvidence {
+    let mut evidence = emitted_rule_evidence(matched);
+    evidence.match_class = match_class;
+    evidence.behavior_tags = behavior_tags.to_vec();
+    evidence
+}
+
+fn behavior_group(tag: &str) -> &'static str {
+    match tag {
+        "remote_fetch" | "dynamic_execution" | "payload_drop" | "shell_execution" => "execution",
+        "callback" | "exfiltration" | "cloud_exfiltration" => "exfiltration",
+        "command_and_control" => "command_and_control",
+        "reconnaissance" | "ci_targeting" => "reconnaissance",
+        "credential_or_wallet_theft" | "browser_targeting" | "crypto_targeting" => "theft",
+        "persistence_or_propagation" => "persistence",
+        "target_mutation" => "target_mutation",
+        "install_or_build_execution" => "install_or_build_execution",
+        "evasion" | "obfuscation" => "stealth",
+        _ => "misc",
     }
 }
 
@@ -211,6 +387,9 @@ impl From<&StoredReleaseDiff> for DiffAssessmentInput {
             files_removed_count,
             files_changed_count,
             package_manifest_only,
+            target_has_install_scripts,
+            install_scripts_longstanding,
+            install_hook_changed,
         ) = match &value.diff {
             Some(diff) => (
                 diff.content.available,
@@ -223,8 +402,20 @@ impl From<&StoredReleaseDiff> for DiffAssessmentInput {
                     &diff.content.files_removed,
                     &diff.content.files_changed,
                 ),
+                diff.content
+                    .npm_install_hook
+                    .as_ref()
+                    .map(|hook| hook.target_has_install_scripts),
+                diff.content
+                    .npm_install_hook
+                    .as_ref()
+                    .map(|hook| hook.longstanding_unchanged),
+                diff.content
+                    .npm_install_hook
+                    .as_ref()
+                    .map(|hook| hook.effective_changed),
             ),
-            None => (false, false, 0, 0, 0, false),
+            None => (false, false, 0, 0, 0, false, None, None, None),
         };
         Self {
             status: value.status.as_str(),
@@ -235,6 +426,9 @@ impl From<&StoredReleaseDiff> for DiffAssessmentInput {
             files_removed_count,
             files_changed_count,
             package_manifest_only,
+            target_has_install_scripts,
+            install_scripts_longstanding,
+            install_hook_changed,
         }
     }
 }
@@ -313,16 +507,16 @@ mod tests {
     use crate::{
         capture::ReleaseStatus,
         diff::{ReleaseDiff, StoredReleaseDiffStatus},
-        event::Ecosystem,
+        event::{DetectionMatchClass, Ecosystem, ReleaseVerdictClass},
         priority::{PrioritySnapshot, PrioritySource, PriorityTier},
         repo_provenance::{RepositoryMatchKind, RepositoryProvider},
         store::PackageRepositoryIdentity,
     };
 
     #[test]
-    fn assessment_escalates_repo_mismatch_with_impact_and_content() {
+    fn assessment_keeps_repo_mismatch_with_impact_and_content_informational() {
         let event = sample_event(PriorityTier::Medium, "1.2.3");
-        let capture = sample_capture(true);
+        let capture = sample_capture(false);
         let repository = Some(sample_repository(true));
         let graph = Some(GraphEvidence {
             ecosystem: Ecosystem::Pypi,
@@ -340,7 +534,7 @@ mod tests {
                 updated_at: Utc::now().to_rfc3339(),
             }),
         });
-        let diff = Some(sample_diff(1, 0, 3));
+        let diff = Some(sample_diff(1, 0, 5));
 
         let assessment = assess_release(
             &event,
@@ -349,8 +543,11 @@ mod tests {
             repository.as_ref(),
             diff.as_ref(),
         );
-        assert!(assessment.suspicious);
-        assert_eq!(assessment.severity, ReleaseAssessmentSeverity::High);
+        assert!(!assessment.suspicious);
+        assert_eq!(
+            assessment.severity,
+            ReleaseAssessmentSeverity::Informational
+        );
         assert!(
             assessment
                 .factors
@@ -362,6 +559,12 @@ mod tests {
                 .factors
                 .iter()
                 .any(|factor| factor == "content_changed")
+        );
+        assert!(
+            assessment
+                .factors
+                .iter()
+                .any(|factor| factor == "content_churn_large")
         );
     }
 
@@ -409,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn assessment_downgrades_stable_repo_mismatch_without_content_to_warning() {
+    fn assessment_keeps_stable_repo_mismatch_without_content_informational() {
         let event = sample_event(PriorityTier::Medium, "1.2.3");
         let capture = sample_capture(false);
         let repository = Some(sample_repository(true));
@@ -425,20 +628,257 @@ mod tests {
 
         let assessment =
             assess_release(&event, graph.as_ref(), &capture, repository.as_ref(), None);
-        assert_eq!(assessment.severity, ReleaseAssessmentSeverity::Warning);
-        assert!(assessment.suspicious);
+        assert_eq!(
+            assessment.severity,
+            ReleaseAssessmentSeverity::Informational
+        );
+        assert!(!assessment.suspicious);
     }
 
     #[test]
-    fn assessment_downgrades_longstanding_install_script_repo_mismatch() {
+    fn assessment_escalates_malware_shaped_metadata_without_diff() {
+        let event = sample_event(PriorityTier::Low, "2.0.0");
+        let mut capture = sample_capture(false);
+        capture.ecosystem = Ecosystem::Npm;
+        capture.package = "undicy-http".to_string();
+        capture.details["metadata_risk"] = json!({
+            "suspicious": true,
+            "score": 9,
+            "factors": [
+                "native_credential_access_dependency",
+                "credential_theft_capability_combo",
+                "confusable_package_name"
+            ],
+            "reason": "npm metadata for undicy-http combines high-risk native credential, surveillance, or exfiltration dependencies"
+        });
+
+        let assessment = assess_release(&event, None, &capture, None, None);
+        assert!(assessment.suspicious);
+        assert_eq!(assessment.severity, ReleaseAssessmentSeverity::Warning);
+        assert_eq!(
+            assessment.verdict_class,
+            ReleaseVerdictClass::SuspiciousUnknown
+        );
+        assert!(
+            assessment
+                .factors
+                .iter()
+                .any(|factor| factor == "malware_shaped_metadata")
+        );
+    }
+
+    #[test]
+    fn assessment_escalates_malware_shaped_content_without_diff() {
+        let event = sample_event(PriorityTier::Low, "1.0.0");
+        let mut capture = sample_capture(false);
+        capture.details["content_risk"] = json!({
+            "scanned": true,
+            "suspicious": true,
+            "score": 10,
+            "factors": [
+                "npm_runtime_encoded_remote_loader"
+            ],
+            "reason": "npm package fetches remote code and executes it dynamically at runtime",
+            "matches": [{
+                "rule_id": "npm_runtime_encoded_remote_loader",
+                "namespace": "default",
+                "tags": ["malware", "npm", "runtime", "loader"],
+                "match_class": DetectionMatchClass::MaliciousBehavior,
+                "behavior_tags": ["remote_fetch", "dynamic_execution"],
+                "score": 10,
+                "file_path": "index.js",
+                "file_role": "entrypoint",
+                "matched_patterns": ["$loader"],
+                "pattern_matches": [{
+                    "pattern_id": "$loader",
+                    "range_start": 0,
+                    "range_end": 32,
+                    "preview": "new Function.constructor(...)"
+                }],
+                "evidence_kind": "pattern",
+                "description": "npm package fetches remote code and executes it dynamically at runtime"
+            }],
+            "iocs": [
+                {
+                    "kind": "url",
+                    "value": "https://example.com/loader",
+                    "file_path": "index.js"
+                }
+            ],
+            "scanned_files": [],
+            "engine": "yara_x",
+            "rule_set_version": "test"
+        });
+
+        let assessment = assess_release(&event, None, &capture, None, None);
+        assert!(assessment.suspicious);
+        assert_eq!(assessment.severity, ReleaseAssessmentSeverity::High);
+        assert_eq!(assessment.verdict_class, ReleaseVerdictClass::Malware);
+        assert!(
+            assessment
+                .factors
+                .iter()
+                .any(|factor| factor == "malware_shaped_content")
+        );
+        assert!(
+            assessment
+                .factors
+                .iter()
+                .any(|factor| factor == "content_iocs_present")
+        );
+        assert!(
+            assessment
+                .behavior_tags
+                .iter()
+                .any(|tag| tag == "dynamic_execution")
+        );
+    }
+
+    #[test]
+    fn assessment_downgrades_risky_installer_content_to_warning() {
+        let event = sample_event(PriorityTier::Low, "1.0.0");
+        let mut capture = sample_capture(true);
+        capture.ecosystem = Ecosystem::Npm;
+        capture.details["content_risk"] = json!({
+            "scanned": true,
+            "suspicious": true,
+            "score": 8,
+            "factors": ["npm_downloader_and_exec_installer"],
+            "reason": "npm install-time lifecycle target downloads and executes remote content",
+            "matches": [{
+                "rule_id": "npm_downloader_and_exec_installer",
+                "namespace": "default",
+                "tags": ["malware", "npm", "downloader", "installer"],
+                "match_class": DetectionMatchClass::RiskyInstaller,
+                "behavior_tags": ["install_or_build_execution", "remote_fetch"],
+                "score": 8,
+                "file_path": "scripts/install.js",
+                "file_role": "install_script",
+                "matched_patterns": ["$curl"],
+                "pattern_matches": [{
+                    "pattern_id": "$curl",
+                    "range_start": 0,
+                    "range_end": 16,
+                    "preview": "curl https://"
+                }],
+                "evidence_kind": "pattern",
+                "description": "npm install-time lifecycle target downloads and executes remote content"
+            }],
+            "iocs": [],
+            "scanned_files": [],
+            "engine": "yara_x",
+            "rule_set_version": "test"
+        });
+
+        let assessment = assess_release(&event, None, &capture, None, None);
+        assert_eq!(assessment.severity, ReleaseAssessmentSeverity::Warning);
+        assert_eq!(
+            assessment.verdict_class,
+            ReleaseVerdictClass::RiskyInstaller
+        );
+    }
+
+    #[test]
+    fn assessment_downgrades_invasive_tooling_to_warning() {
+        let event = sample_event(PriorityTier::Low, "0.2.3");
+        let mut capture = sample_capture(false);
+        capture.ecosystem = Ecosystem::Npm;
+        capture.details["content_risk"] = json!({
+            "scanned": true,
+            "suspicious": true,
+            "score": 12,
+            "factors": ["npm_mcp_server_injection"],
+            "reason": "npm code injects a rogue MCP server configuration into AI coding tools",
+            "matches": [{
+                "rule_id": "npm_mcp_server_injection",
+                "namespace": "default",
+                "tags": ["malware", "npm", "persistence", "ai"],
+                "match_class": DetectionMatchClass::InvasiveTooling,
+                "behavior_tags": ["target_mutation"],
+                "score": 12,
+                "file_path": "dist/init.js",
+                "file_role": "entrypoint",
+                "matched_patterns": ["$claude"],
+                "pattern_matches": [{
+                    "pattern_id": "$claude",
+                    "range_start": 0,
+                    "range_end": 20,
+                    "preview": ".claude/commands/"
+                }],
+                "evidence_kind": "pattern",
+                "description": "npm code injects a rogue MCP server configuration into AI coding tools"
+            }],
+            "iocs": [],
+            "scanned_files": [],
+            "engine": "yara_x",
+            "rule_set_version": "test"
+        });
+
+        let assessment = assess_release(&event, None, &capture, None, None);
+        assert_eq!(assessment.severity, ReleaseAssessmentSeverity::Warning);
+        assert_eq!(
+            assessment.verdict_class,
+            ReleaseVerdictClass::InvasiveTooling
+        );
+    }
+
+    #[test]
+    fn assessment_downgrades_single_broad_malicious_rule_to_suspicious_unknown_warning() {
+        let event = sample_event(PriorityTier::Low, "3.6.0");
+        let mut capture = sample_capture(false);
+        capture.ecosystem = Ecosystem::Pypi;
+        capture.details["content_risk"] = json!({
+            "scanned": true,
+            "suspicious": true,
+            "score": 10,
+            "factors": ["pypi_browser_credential_theft"],
+            "reason": "PyPI package targets browser login databases, cookies, or credit card storage for credential theft",
+            "matches": [{
+                "rule_id": "pypi_browser_credential_theft",
+                "namespace": "default",
+                "tags": ["malware", "pypi", "theft", "browser"],
+                "match_class": DetectionMatchClass::MaliciousBehavior,
+                "behavior_tags": ["browser_targeting", "credential_or_wallet_theft"],
+                "score": 10,
+                "file_path": "anikoto.py",
+                "file_role": "entrypoint",
+                "matched_patterns": ["$cookies"],
+                "pattern_matches": [{
+                    "pattern_id": "$cookies",
+                    "range_start": 0,
+                    "range_end": 20,
+                    "preview": "cookiesfrombrowser"
+                }],
+                "evidence_kind": "pattern",
+                "description": "PyPI package targets browser login databases, cookies, or credit card storage for credential theft"
+            }],
+            "iocs": [],
+            "scanned_files": [],
+            "engine": "yara_x",
+            "rule_set_version": "test"
+        });
+
+        let assessment = assess_release(&event, None, &capture, None, None);
+        assert_eq!(assessment.severity, ReleaseAssessmentSeverity::Warning);
+        assert_eq!(
+            assessment.verdict_class,
+            ReleaseVerdictClass::SuspiciousUnknown
+        );
+    }
+
+    #[test]
+    fn assessment_keeps_longstanding_install_script_repo_mismatch_informational() {
         let event = sample_event(PriorityTier::Medium, "1.2.3");
         let mut capture = sample_capture(true);
         capture.details["install_scripts_longstanding"] = json!(true);
         let repository = Some(sample_repository(true));
 
         let assessment = assess_release(&event, None, &capture, repository.as_ref(), None);
-        assert_eq!(assessment.severity, ReleaseAssessmentSeverity::Warning);
-        assert!(assessment.suspicious);
+        assert_eq!(
+            assessment.severity,
+            ReleaseAssessmentSeverity::Informational
+        );
+        assert!(!assessment.suspicious);
         assert!(
             assessment
                 .factors
@@ -448,15 +888,18 @@ mod tests {
     }
 
     #[test]
-    fn assessment_downgrades_benign_install_script_repo_mismatch() {
+    fn assessment_keeps_benign_install_script_repo_mismatch_informational() {
         let event = sample_event(PriorityTier::Medium, "1.2.3");
         let mut capture = sample_capture(true);
         capture.details["install_scripts_benign"] = json!(true);
         let repository = Some(sample_repository(true));
 
         let assessment = assess_release(&event, None, &capture, repository.as_ref(), None);
-        assert_eq!(assessment.severity, ReleaseAssessmentSeverity::Warning);
-        assert!(assessment.suspicious);
+        assert_eq!(
+            assessment.severity,
+            ReleaseAssessmentSeverity::Informational
+        );
+        assert!(!assessment.suspicious);
         assert!(
             assessment
                 .factors
@@ -466,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn assessment_downgrades_repo_mismatch_when_only_package_manifest_changed() {
+    fn assessment_keeps_repo_mismatch_manifest_only_change_informational() {
         let event = sample_event(PriorityTier::High, "1.2.3");
         let capture = sample_capture(false);
         let repository = Some(sample_repository(true));
@@ -489,13 +932,113 @@ mod tests {
             repository.as_ref(),
             Some(&diff),
         );
-        assert_eq!(assessment.severity, ReleaseAssessmentSeverity::Warning);
-        assert!(assessment.suspicious);
+        assert_eq!(
+            assessment.severity,
+            ReleaseAssessmentSeverity::Informational
+        );
+        assert!(!assessment.suspicious);
         assert!(
             assessment
                 .factors
                 .iter()
                 .any(|factor| factor == "package_manifest_only")
+        );
+    }
+
+    #[test]
+    fn assessment_keeps_small_repo_mismatch_content_informational() {
+        let event = sample_event(PriorityTier::Medium, "0.1.6");
+        let capture = sample_capture(false);
+        let repository = Some(sample_repository(true));
+        let graph = Some(GraphEvidence {
+            ecosystem: Ecosystem::Npm,
+            package: "demo".to_string(),
+            known: true,
+            direct_popularity: 0.0,
+            direct_dependencies_seen: 2,
+            reverse_dependents_seen: 3,
+            repository: None,
+        });
+        let diff = sample_diff(0, 0, 2);
+
+        let assessment = assess_release(
+            &event,
+            graph.as_ref(),
+            &capture,
+            repository.as_ref(),
+            Some(&diff),
+        );
+        assert_eq!(
+            assessment.severity,
+            ReleaseAssessmentSeverity::Informational
+        );
+        assert!(!assessment.suspicious);
+        assert!(
+            assessment
+                .factors
+                .iter()
+                .any(|factor| factor == "content_changed")
+        );
+        assert!(
+            !assessment
+                .factors
+                .iter()
+                .any(|factor| factor == "content_churn_large")
+        );
+        assert_eq!(
+            assessment.reason,
+            "repository mismatch observed with concrete content changes but no additional corroborating security signals"
+        );
+    }
+
+    #[test]
+    fn assessment_keeps_repo_mismatch_with_risky_install_time_execution_as_warning() {
+        let event = sample_event(PriorityTier::Medium, "1.2.3");
+        let mut capture = sample_capture(true);
+        capture.details["install_scripts_longstanding"] = json!(false);
+        capture.details["install_scripts_benign"] = json!(false);
+        let repository = Some(sample_repository(true));
+
+        let assessment = assess_release(&event, None, &capture, repository.as_ref(), None);
+        assert_eq!(assessment.severity, ReleaseAssessmentSeverity::Warning);
+        assert!(assessment.suspicious);
+        assert_eq!(
+            assessment.reason,
+            "repository mismatch combined with install-time execution"
+        );
+    }
+
+    #[test]
+    fn assessment_does_not_escalate_longstanding_unchanged_install_hook() {
+        let event = sample_event(PriorityTier::Medium, "1.2.3");
+        let mut capture = sample_capture(true);
+        capture.details["install_scripts_benign"] = json!(false);
+        capture.details["install_scripts_longstanding"] = json!(false);
+        let graph = Some(GraphEvidence {
+            ecosystem: Ecosystem::Npm,
+            package: "demo".to_string(),
+            known: true,
+            direct_popularity: 0.0,
+            direct_dependencies_seen: 1,
+            reverse_dependents_seen: 2,
+            repository: None,
+        });
+        let mut diff = sample_diff(0, 0, 3);
+        diff.target_has_install_scripts = Some(true);
+        diff.install_scripts_longstanding = Some(true);
+        diff.install_hook_changed = Some(false);
+
+        let assessment = assess_release(&event, graph.as_ref(), &capture, None, Some(&diff));
+        assert_eq!(
+            assessment.severity,
+            ReleaseAssessmentSeverity::Informational
+        );
+        assert!(!assessment.suspicious);
+        assert!(
+            assessment
+                .factors
+                .iter()
+                .any(|factor| factor == "install_time_execution_longstanding")
         );
     }
 
@@ -558,6 +1101,7 @@ mod tests {
                 RepositoryMatchKind::Tag
             },
             matched_ref: (!suspicious).then_some("v1.2.3".to_string()),
+            matched_commit: None,
             suspicious,
             reason: if suspicious {
                 "repository resolved on GitHub but no matching tag or release was found for the package version".to_string()
@@ -626,6 +1170,8 @@ mod tests {
                     files_removed_detail: Vec::new(),
                     files_changed_detail: Vec::new(),
                     file_patches: Vec::new(),
+                    npm_install_hook: None,
+                    crate_repository_commit: None,
                 },
                 notes: Vec::new(),
             }),

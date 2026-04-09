@@ -1,0 +1,7 @@
+{
+  "name": "@modular-prompt/driver",
+  "version": "0.11.2",
+  "scripts": {
+    "postinstall": "node scripts/setup-mlx.js || true"
+  }
+}

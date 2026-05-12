@@ -2,3 +2,7 @@
 .DS_Store
 .supply-stream-data/
 .supply-stream-state/
+.artifacts/
+.cargo/
+.claude/
+.staging/

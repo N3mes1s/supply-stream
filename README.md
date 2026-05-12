@@ -1,6 +1,16 @@
 # supply-stream
 
-`supply-stream` is a Rust fan-in service for near-real-time package release events across ecosystems. It now has two jobs:
+`supply-stream` is a Rust service for near-real-time software supply-chain monitoring across package ecosystems.
+
+It watches new releases from `npm`, `PyPI`, and `crates.io`, normalizes them into one event stream, and then decides which releases deserve deeper capture and diff work based on package impact and risk signals.
+
+In practice, the project does three things:
+
+- ingests fresh package-release events across ecosystems
+- preserves local evidence for each release so later investigation is possible
+- prioritizes capture and diff work so analysis stays focused on high-impact or suspicious packages
+
+The runtime is designed for downstream malware triage and incident reconstruction, not just feed collection. It now has two jobs:
 
 - emit normalized release events as NDJSON on stdout for downstream scanners such as `~/code/aegis`
 - preserve a local evidence trail for each observed release so later incident reconstruction is possible
@@ -467,6 +477,8 @@ Reconcile flat files into the operational index and inspect its counts:
 cargo run -- history sync
 cargo run -- history stats
 cargo run -- history stats --json
+cargo run -- history report --since-hours 24
+cargo run -- history report --since-hours 24 --json
 ```
 
 Inspect historical events for one package:
@@ -495,6 +507,12 @@ Enable it in this clone with:
 ```bash
 git config core.hooksPath .githooks
 ```
+
+## RFDs
+
+Operational decision records live under [`rfd/`](rfd/README.md).
+
+- [`RFD 0001`](rfd/0001-realtime-triage-pipeline.md): realtime triage pipeline, source of truth, and operating scoreboard
 
 ## Design notes
 

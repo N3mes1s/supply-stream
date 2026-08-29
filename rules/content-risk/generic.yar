@@ -569,7 +569,7 @@ rule generic_discord_or_telegram_exfil : malware exfil
         $discord = "discord.com/api/webhooks/" nocase
         $discord_app = "discordapp.com/api/webhooks/" nocase
         $discord_ptb = "ptb.discord.com/api/webhooks/" nocase
-        $telegram = /[0-9]{8,10}:[A-Za-z0-9_-]{35}/
+        $telegram = /[0-9]{8,10}:AA[A-Za-z0-9_-]{33}/
     condition:
         1 of them
 }

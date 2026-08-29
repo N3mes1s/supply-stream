@@ -23,6 +23,7 @@ const MAX_MANIFEST_TEXT_BYTES: usize = 512 * 1024;
 const MAX_INSTALL_SCRIPT_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ENTRYPOINT_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SCRIPTS_DIR_TEXT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_EAGER_TEXT_CACHE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TRANSITIVE_INSTALL_SCRIPT_DEPTH: usize = 2;
 const MAX_INSTALL_SCRIPT_FILES: usize = 16;
 const MAX_TRANSITIVE_ENTRYPOINT_DEPTH: usize = 3;
@@ -105,7 +106,11 @@ fn main(data: &[u8], _meta: Option<&[u8]>) -> Result<Npm, ModuleError> {
         return Ok(npm);
     }
 
-    let Some(entries) = extract_archive_entries(data) else {
+    let Some(ExtractedArchive {
+        files: entries,
+        text_cache,
+    }) = extract_archive_entries(data)
+    else {
         return Ok(npm);
     };
 
@@ -203,6 +208,7 @@ fn main(data: &[u8], _meta: Option<&[u8]>) -> Result<Npm, ModuleError> {
         &root_manifest_path,
         &install_script_paths,
         &entrypoint_paths,
+        &text_cache,
         &mut root_files,
     );
     expand_transitive_install_script_paths(
@@ -211,6 +217,7 @@ fn main(data: &[u8], _meta: Option<&[u8]>) -> Result<Npm, ModuleError> {
         &root_manifest_path,
         &mut install_script_paths,
         &entrypoint_paths,
+        &text_cache,
         &mut root_files,
     );
     expand_transitive_entrypoint_paths(
@@ -219,6 +226,7 @@ fn main(data: &[u8], _meta: Option<&[u8]>) -> Result<Npm, ModuleError> {
         &root_manifest_path,
         &install_script_paths,
         &mut entrypoint_paths,
+        &text_cache,
         &mut root_files,
     );
 
@@ -465,10 +473,21 @@ fn name_contains(ctx: &mut ScanContext, needle: RuntimeString) -> Option<bool> {
     )
 }
 
-fn extract_archive_entries(data: &[u8]) -> Option<BTreeMap<String, ArchiveFile>> {
+/// The decompressed entries plus an eager cache of text-file content, keyed
+/// by archive path. Later hydration passes read from the cache instead of
+/// re-decompressing the archive; the cache is best-effort (budget-capped),
+/// so hydration falls back to a decompression pass on a miss.
+struct ExtractedArchive {
+    files: BTreeMap<String, ArchiveFile>,
+    text_cache: BTreeMap<String, String>,
+}
+
+fn extract_archive_entries(data: &[u8]) -> Option<ExtractedArchive> {
     let decoder = GzDecoder::new(Cursor::new(data));
     let mut archive = Archive::new(decoder);
     let mut files = BTreeMap::new();
+    let mut text_cache = BTreeMap::new();
+    let mut cached_bytes = 0usize;
 
     let entries = archive.entries().ok()?;
     for entry in entries {
@@ -482,6 +501,7 @@ fn extract_archive_entries(data: &[u8]) -> Option<BTreeMap<String, ArchiveFile>>
             return None;
         }
         let is_vendored = is_vendored_path(&path);
+        let size_bytes = bytes.len() as u64;
         let text_content = if !is_vendored
             && path.ends_with("package.json")
             && bytes.len() <= MAX_MANIFEST_TEXT_BYTES
@@ -491,18 +511,28 @@ fn extract_archive_entries(data: &[u8]) -> Option<BTreeMap<String, ArchiveFile>>
         } else {
             None
         };
+        if text_content.is_none()
+            && !is_vendored
+            && bytes.len() <= MAX_INSTALL_SCRIPT_TEXT_BYTES
+            && cached_bytes.saturating_add(bytes.len()) <= MAX_EAGER_TEXT_CACHE_TOTAL_BYTES
+            && looks_like_text(&bytes)
+            && let Ok(content) = String::from_utf8(bytes)
+        {
+            cached_bytes += content.len();
+            text_cache.insert(path.clone(), content);
+        }
         files.insert(
             path.clone(),
             ArchiveFile {
                 path,
-                size_bytes: bytes.len() as u64,
+                size_bytes,
                 text_content,
                 is_vendored,
             },
         );
     }
 
-    Some(files)
+    Some(ExtractedArchive { files, text_cache })
 }
 
 fn select_root_manifest(entries: &BTreeMap<String, ArchiveFile>) -> Option<(String, String)> {
@@ -724,8 +754,43 @@ fn hydrate_selected_root_text_content(
     root_manifest_path: &str,
     install_script_paths: &BTreeSet<String>,
     entrypoint_paths: &BTreeSet<String>,
+    text_cache: &BTreeMap<String, String>,
     root_files: &mut BTreeMap<String, ArchiveFile>,
 ) {
+    // Serve candidates from the eager text cache first; only fall back to a
+    // fresh decompression pass when a candidate is missing from the cache.
+    let mut cache_missed = false;
+    let candidates = root_files
+        .iter()
+        .filter_map(|(relative, file)| {
+            if file.is_vendored || file.text_content.is_some() {
+                return None;
+            }
+            let role = classify_file_role(
+                relative,
+                file.is_vendored,
+                relative == root_manifest_path,
+                install_script_paths,
+                entrypoint_paths,
+            );
+            let limit = selected_text_limit(relative, role)?;
+            (file.size_bytes as usize <= limit).then(|| relative.clone())
+        })
+        .collect::<Vec<_>>();
+    for relative in candidates {
+        let archive_path = format!("{root_prefix}{relative}");
+        if let Some(content) = text_cache.get(&archive_path) {
+            if let Some(file) = root_files.get_mut(&relative) {
+                file.text_content = Some(content.clone());
+            }
+        } else {
+            cache_missed = true;
+        }
+    }
+    if !cache_missed {
+        return;
+    }
+
     let decoder = GzDecoder::new(Cursor::new(data));
     let mut archive = Archive::new(decoder);
     let Ok(entries) = archive.entries() else {
@@ -787,6 +852,7 @@ fn expand_transitive_entrypoint_paths(
     root_manifest_path: &str,
     install_script_paths: &BTreeSet<String>,
     entrypoint_paths: &mut BTreeSet<String>,
+    text_cache: &BTreeMap<String, String>,
     root_files: &mut BTreeMap<String, ArchiveFile>,
 ) {
     let mut frontier: Vec<String> = entrypoint_paths.iter().cloned().collect();
@@ -831,6 +897,7 @@ fn expand_transitive_entrypoint_paths(
             root_manifest_path,
             install_script_paths,
             entrypoint_paths,
+            text_cache,
             root_files,
         );
         frontier = next;
@@ -843,6 +910,7 @@ fn expand_transitive_install_script_paths(
     root_manifest_path: &str,
     install_script_paths: &mut BTreeSet<String>,
     entrypoint_paths: &BTreeSet<String>,
+    text_cache: &BTreeMap<String, String>,
     root_files: &mut BTreeMap<String, ArchiveFile>,
 ) {
     let mut frontier: Vec<String> = install_script_paths.iter().cloned().collect();
@@ -890,6 +958,7 @@ fn expand_transitive_install_script_paths(
             root_manifest_path,
             install_script_paths,
             entrypoint_paths,
+            text_cache,
             root_files,
         );
         frontier = next;

@@ -44,7 +44,7 @@ static DISCORD_WEBHOOK_REGEX: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid Discord webhook regex")
 });
 static TELEGRAM_TOKEN_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\b[0-9]{8,10}:[A-Za-z0-9_-]{35}\b"#).expect("valid Telegram token regex")
+    Regex::new(r#"\b[0-9]{8,10}:AA[A-Za-z0-9_-]{33}\b"#).expect("valid Telegram token regex")
 });
 static IPV4_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b"#).expect("valid IPv4 regex")

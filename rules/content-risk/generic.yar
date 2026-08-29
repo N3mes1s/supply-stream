@@ -1026,6 +1026,181 @@ rule npm_npm_token_worm_propagation : malware npm worm
         )
 }
 
+rule npm_installer_bun_downloader_local_payload : suspicious npm downloader installer loader
+{
+    meta:
+        score = 8
+        description = "npm install script downloads Bun from release artifacts, extracts a local runtime, and executes a package-local JavaScript payload"
+    condition:
+        npm.is_npm and
+        npm.has_install_script and
+        npm.file_count("install_script") > 0 and
+        npm.any_file_contains("install_script", "github.com/oven-sh/bun/releases/download/bun-v") and
+        (
+            npm.any_file_contains("install_script", "execFileSync(binPath, [\"") or
+            npm.any_file_contains("install_script", "spawnSync(binPath, [\"") or
+            npm.any_file_contains("install_script", "spawn(binPath, [\"")
+        ) and
+        (
+            npm.any_file_contains("install_script", "extractFromZip(") or
+            npm.any_file_contains("install_script", "_bun_tmp.zip") or
+            npm.any_file_contains("install_script", "bun-linux-x64-baseline") or
+            npm.any_file_contains("install_script", "bun-windows-x64-baseline")
+        ) and
+        (
+            npm.any_file_contains("install_script", "dist.js") or
+            npm.any_file_contains("install_script", "bw1.js")
+        )
+}
+
+rule npm_github_actions_secret_artifact_exfil : malware npm ci exfil theft
+{
+    meta:
+        score = 10
+        description = "npm code writes or embeds a GitHub Actions workflow that serializes secrets into an uploaded artifact"
+    condition:
+        npm.is_npm and
+        (
+            npm.any_file_contains("entrypoint", "toJSON(secrets)") or
+            npm.any_file_contains("install_script", "toJSON(secrets)")
+        ) and
+        (
+            npm.any_file_contains("entrypoint", "actions/upload-artifact") or
+            npm.any_file_contains("install_script", "actions/upload-artifact")
+        ) and
+        (
+            npm.any_file_contains("entrypoint", "format-results") or
+            npm.any_file_contains("entrypoint", "VARIABLE_STORE") or
+            npm.any_file_contains("install_script", "format-results") or
+            npm.any_file_contains("install_script", "VARIABLE_STORE")
+        )
+}
+
+rule npm_github_actions_runner_memory_secret_scrape : malware npm ci theft recon
+{
+    meta:
+        score = 10
+        description = "npm code targets GitHub Actions Runner.Worker process memory to scrape in-memory secret values"
+    condition:
+        npm.is_npm and
+        (
+            npm.any_file_contains("entrypoint", "Runner.Worker") or
+            npm.any_file_contains("install_script", "Runner.Worker")
+        ) and
+        (
+            npm.any_file_contains("entrypoint", "/proc/") or
+            npm.any_file_contains("entrypoint", "/maps") or
+            npm.any_file_contains("install_script", "/proc/") or
+            npm.any_file_contains("install_script", "/maps")
+        ) and
+        (
+            npm.any_file_contains("entrypoint", "/mem") or
+            npm.any_file_contains("install_script", "/mem")
+        ) and
+        (
+            npm.any_file_contains("entrypoint", "isSecret") or
+            npm.any_file_contains("entrypoint", "tr -d") or
+            npm.any_file_contains("entrypoint", "sort -u") or
+            npm.any_file_contains("install_script", "isSecret") or
+            npm.any_file_contains("install_script", "tr -d") or
+            npm.any_file_contains("install_script", "sort -u")
+        )
+}
+
+rule npm_cloud_secret_manager_exfiltration : malware npm theft cloud exfil
+{
+    meta:
+        score = 10
+        description = "npm code reads cloud secret-manager APIs and combines the access with an exfiltration path"
+    condition:
+        npm.is_npm and
+        (
+            (
+                (
+                    npm.any_file_contains("entrypoint", "SecretManagerServiceClient") or
+                    npm.any_file_contains("install_script", "SecretManagerServiceClient")
+                ) and
+                (
+                    npm.any_file_contains("entrypoint", "accessSecretVersion") or
+                    npm.any_file_contains("install_script", "accessSecretVersion")
+                )
+            ) or
+            (
+                (
+                    npm.any_file_contains("entrypoint", "DescribeParameters") or
+                    npm.any_file_contains("install_script", "DescribeParameters")
+                ) and
+                (
+                    npm.any_file_contains("entrypoint", "WithDecryption") or
+                    npm.any_file_contains("install_script", "WithDecryption")
+                )
+            ) or
+            (
+                (
+                    npm.any_file_contains("entrypoint", "GetSecretValue") or
+                    npm.any_file_contains("install_script", "GetSecretValue")
+                ) and
+                (
+                    npm.any_file_contains("entrypoint", "ListSecrets") or
+                    npm.any_file_contains("install_script", "ListSecrets")
+                )
+            ) or
+            (
+                (
+                    npm.any_file_contains("entrypoint", "KeyVault") or
+                    npm.any_file_contains("install_script", "KeyVault")
+                ) and
+                (
+                    npm.any_file_contains("entrypoint", "listSecrets") or
+                    npm.any_file_contains("install_script", "listSecrets")
+                )
+            )
+        ) and
+        (
+            npm.any_file_contains("entrypoint", "createOrUpdateFileContents") or
+            npm.any_file_contains("entrypoint", "audit.checkmarx") or
+            npm.any_file_contains("entrypoint", "v1/telemetry") or
+            npm.any_file_contains("entrypoint", "LongLiveTheResistanceAgainstMachines") or
+            npm.any_file_contains("install_script", "createOrUpdateFileContents") or
+            npm.any_file_contains("install_script", "audit.checkmarx") or
+            npm.any_file_contains("install_script", "v1/telemetry") or
+            npm.any_file_contains("install_script", "LongLiveTheResistanceAgainstMachines")
+        )
+}
+
+rule npm_npm_token_publish_worm_propagation : malware npm worm
+{
+    meta:
+        score = 10
+        description = "npm code validates npm tokens, rewrites packages with install-time payloads, and publishes infected tarballs"
+    condition:
+        npm.is_npm and
+        (
+            npm.any_file_contains("entrypoint", "/-/npm/v1/tokens") or
+            npm.any_file_contains("entrypoint", "registry.npmjs.org/-/npm/v1/tokens") or
+            npm.any_file_contains("install_script", "/-/npm/v1/tokens") or
+            npm.any_file_contains("install_script", "registry.npmjs.org/-/npm/v1/tokens")
+        ) and
+        (
+            npm.any_file_contains("entrypoint", "bypass_2fa") or
+            npm.any_file_contains("entrypoint", "/-/whoami") or
+            npm.any_file_contains("install_script", "bypass_2fa") or
+            npm.any_file_contains("install_script", "/-/whoami")
+        ) and
+        (
+            npm.any_file_contains("entrypoint", "bun publish") or
+            npm.any_file_contains("entrypoint", "package-updated.tgz") or
+            npm.any_file_contains("entrypoint", "preinstall") and
+            npm.any_file_contains("entrypoint", "setup.mjs") and
+            npm.any_file_contains("entrypoint", "dist.js") or
+            npm.any_file_contains("install_script", "bun publish") or
+            npm.any_file_contains("install_script", "package-updated.tgz") or
+            npm.any_file_contains("install_script", "preinstall") and
+            npm.any_file_contains("install_script", "setup.mjs") and
+            npm.any_file_contains("install_script", "dist.js")
+        )
+}
+
 rule npm_ci_environment_targeting : suspicious npm recon ci
 {
     meta:
@@ -1200,6 +1375,46 @@ rule npm_github_propagation_worm : malware npm worm propagation
             npm.any_file_contains("entrypoint", "github_pat_") or
             npm.any_file_contains("install_script", "GITHUB_TOKEN") or
             npm.any_file_contains("install_script", "ghp_")
+        )
+}
+
+rule npm_install_github_commit_secret_exfil : malware npm installer exfil theft worm
+{
+    meta:
+        score = 10
+        description = "npm install-time code harvests tokens or local secrets and writes exfiltrated data into GitHub commits, matching TeamPCP-style public repo exfiltration"
+    condition:
+        npm.is_npm and
+        npm.has_install_script and
+        npm.file_count("install_script") > 0 and
+        (
+            npm.any_file_contains("install_script", "createOrUpdateFileContents") or
+            npm.any_file_contains("install_script", "repos.createOrUpdateFileContents")
+        ) and
+        (
+            npm.any_file_contains("install_script", "createForAuthenticatedUser") or
+            npm.any_file_contains("install_script", "auto_init") or
+            npm.any_file_contains("install_script", "/user/repos") or
+            npm.any_file_contains("install_script", "users.getAuthenticated")
+        ) and
+        (
+            npm.any_file_contains("install_script", "GITHUB_TOKEN") or
+            npm.any_file_contains("install_script", "ghp_") or
+            npm.any_file_contains("install_script", "gho_") or
+            npm.any_file_contains("install_script", "github_pat_")
+        ) and
+        (
+            npm.any_file_contains("install_script", ".npmrc") or
+            npm.any_file_contains("install_script", "NPM_TOKEN") or
+            npm.any_file_contains("install_script", "NODE_AUTH_TOKEN") or
+            npm.any_file_contains("install_script", "npmtoken") or
+            npm.any_file_contains("install_script", ".ssh/id_rsa") or
+            npm.any_file_contains("install_script", ".ssh/id_ed25519") or
+            npm.any_file_contains("install_script", ".git-credentials") or
+            npm.any_file_contains("install_script", ".aws/credentials") or
+            npm.any_file_contains("install_script", ".kube/config") or
+            npm.any_file_contains("install_script", "application_default_credentials.json") or
+            npm.any_file_contains("install_script", ".env")
         )
 }
 

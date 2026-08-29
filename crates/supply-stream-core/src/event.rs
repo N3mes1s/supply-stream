@@ -91,10 +91,17 @@ pub struct EmittedReleaseAssessmentSignal {
     pub suspicious: bool,
     pub signal_type: &'static str,
     pub severity: ReleaseAssessmentSeverity,
+    pub verdict_class: ReleaseVerdictClass,
     pub priority_tier: PriorityTier,
     pub graph: EmittedGraphEvidence,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub factors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub behavior_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_rules: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_evidence: Vec<EmittedMatchedRuleEvidence>,
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<RepositoryReleaseProvenance>,
@@ -116,7 +123,7 @@ pub struct EmittedPrioritySignal {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RepositorySignalSeverity {
     Informational,
@@ -134,7 +141,7 @@ impl RepositorySignalSeverity {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReleaseAssessmentSeverity {
     Informational,
@@ -150,6 +157,64 @@ impl ReleaseAssessmentSeverity {
             Self::High => "high",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseVerdictClass {
+    Clean,
+    SuspiciousUnknown,
+    RiskyInstaller,
+    InvasiveTooling,
+    Malware,
+}
+
+impl ReleaseVerdictClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::SuspiciousUnknown => "suspicious_unknown",
+            Self::RiskyInstaller => "risky_installer",
+            Self::InvasiveTooling => "invasive_tooling",
+            Self::Malware => "malware",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DetectionMatchClass {
+    MaliciousBehavior,
+    RiskyInstaller,
+    InvasiveTooling,
+    ContextOnly,
+}
+
+impl DetectionMatchClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MaliciousBehavior => "malicious_behavior",
+            Self::RiskyInstaller => "risky_installer",
+            Self::InvasiveTooling => "invasive_tooling",
+            Self::ContextOnly => "context_only",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EmittedMatchedRuleEvidence {
+    pub rule_id: String,
+    pub match_class: DetectionMatchClass,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub behavior_tags: Vec<String>,
+    pub file_path: String,
+    pub file_role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pattern_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -52,6 +52,33 @@
       }
     },
     {
+      "id": "bitwarden_cli_teampcp",
+      "ecosystem": "npm",
+      "package": "@bitwarden/cli",
+      "version": "2026.4.0",
+      "format": "npm_tgz",
+      "fixture_dir": "bitwarden-cli-teampcp",
+      "expected_verdict_class": "malware",
+      "expected_max_severity": "high",
+      "required_rules": [
+        "npm_install_github_commit_secret_exfil",
+        "npm_installer_bun_downloader_local_payload",
+        "npm_github_actions_secret_artifact_exfil",
+        "npm_github_actions_runner_memory_secret_scrape",
+        "npm_cloud_secret_manager_exfiltration",
+        "npm_npm_token_publish_worm_propagation"
+      ],
+      "required_behavior_tags": [
+        "credential_or_wallet_theft",
+        "exfiltration",
+        "install_or_build_execution",
+        "persistence_or_propagation"
+      ],
+      "details": {
+        "has_install_scripts": true
+      }
+    },
+    {
       "id": "modular_prompt_driver",
       "ecosystem": "npm",
       "package": "@modular-prompt/driver",

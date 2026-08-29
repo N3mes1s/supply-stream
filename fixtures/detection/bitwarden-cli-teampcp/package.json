@@ -1,0 +1,14 @@
+{
+  "name": "@bitwarden/cli",
+  "version": "2026.4.0",
+  "description": "Regression fixture for TeamPCP-style npm install exfiltration",
+  "scripts": {
+    "preinstall": "node bw_setup.js"
+  },
+  "bin": {
+    "bw": "bw_setup.js"
+  },
+  "dependencies": {
+    "@octokit/rest": "^21.0.0"
+  }
+}

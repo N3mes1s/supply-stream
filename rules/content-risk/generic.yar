@@ -233,6 +233,37 @@ rule npm_downloader_pipe_to_shell_installer : malware npm downloader installer
         )
 }
 
+rule npm_install_remote_payload_shell_exec : malware npm downloader loader
+{
+    meta:
+        score = 9
+        description = "npm install-time lifecycle target downloads remote content and runs it through a shell command interpreter or dynamic code evaluation, executing attacker-controlled code at install time"
+    condition:
+        npm.is_npm and
+        npm.has_install_script and
+        npm.file_count("install_script") > 0 and
+        (
+            npm.any_file_contains("install_script", "https.get(") or
+            npm.any_file_contains("install_script", "http.get(") or
+            npm.any_file_contains("install_script", "https.request(") or
+            npm.any_file_contains("install_script", "fetch(") or
+            npm.any_file_contains("install_script", "axios.get(") or
+            npm.any_file_contains("install_script", "axios(") or
+            npm.any_file_contains("install_script", "Invoke-WebRequest")
+        ) and
+        (
+            // Shell-command and dynamic-eval sinks. A legitimate native binary
+            // bootstrap runs the downloaded file with execFile/spawn on a path;
+            // it never feeds the response into bash -c, eval, or new Function.
+            npm.any_file_contains("install_script", "bash -c") or
+            npm.any_file_contains("install_script", "sh -c") or
+            npm.any_file_contains("install_script", "eval(") or
+            npm.any_file_contains("install_script", "new Function(") or
+            npm.any_file_contains("install_script", "Invoke-Expression") or
+            npm.any_file_contains("install_script", "IEX(")
+        )
+}
+
 rule npm_downloader_and_exec_installer : suspicious npm downloader installer
 {
     meta:

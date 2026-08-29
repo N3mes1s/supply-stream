@@ -124,6 +124,27 @@
       "required_rules": [
         "generic_browser_credential_database"
       ]
+    },
+    {
+      "id": "npm_install_remote_shell",
+      "ecosystem": "npm",
+      "package": "npm-install-remote-shell",
+      "version": "1.1.4",
+      "format": "npm_tgz",
+      "fixture_dir": "npm-install-remote-shell",
+      "expected_verdict_class": "malware",
+      "expected_max_severity": "high",
+      "required_rules": [
+        "npm_install_remote_payload_shell_exec",
+        "npm_downloader_and_exec_installer"
+      ],
+      "required_behavior_tags": [
+        "remote_fetch",
+        "install_or_build_execution"
+      ],
+      "details": {
+        "main": "index.js"
+      }
     }
   ]
 }

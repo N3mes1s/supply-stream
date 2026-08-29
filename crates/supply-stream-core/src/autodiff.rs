@@ -269,7 +269,7 @@ impl DiffContext {
         }
 
         let Some(provenance) = repo_provenance::check_repository_commit_provenance(
-            &reqwest::Client::new(),
+            &crate::diff::DIFF_HTTP_CLIENT,
             &repository.repository_url,
             &event.version,
             target_commit,

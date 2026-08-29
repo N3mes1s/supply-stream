@@ -27,7 +27,7 @@ use crate::{
 
 pub const DEFAULT_PATCH_CONTEXT: usize = 3;
 
-static DIFF_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+pub(crate) static DIFF_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .user_agent("supply-stream-diff/0.1.0")
         .http2_adaptive_window(true)
@@ -806,10 +806,22 @@ async fn resolve_baseline_input(
 }
 
 fn history_input(entry: HistoryEntry) -> DiffInput {
+    // Prefer the artifact the capture stage already wrote to disk; falling
+    // back to None re-downloads it from the registry.
+    let artifact_path = entry.capture.as_ref().and_then(|capture| {
+        let recorded = PathBuf::from(capture_local_artifact_path(capture)?);
+        let resolved = if recorded.is_absolute() {
+            recorded
+        } else {
+            entry.capture_dir.as_ref()?.join(recorded)
+        };
+        resolved.is_file().then_some(resolved)
+    });
+
     DiffInput {
         history_lookup_version: Some(entry.event.version.clone()),
         entry,
-        artifact_path: None,
+        artifact_path,
     }
 }
 

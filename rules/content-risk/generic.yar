@@ -2215,15 +2215,12 @@ rule pypi_bulk_env_exfiltration : malware pypi exfil recon
         (
             pypi.any_file_contains("build_script", "dict(os.environ)") or
             pypi.any_file_contains("build_script", "str(os.environ)") or
-            pypi.any_file_contains("build_script", "os.environ.copy()") or
             pypi.any_file_contains("build_script", "json.dumps(os.environ") or
             pypi.any_file_contains("entrypoint", "dict(os.environ)") or
             pypi.any_file_contains("entrypoint", "str(os.environ)") or
-            pypi.any_file_contains("entrypoint", "os.environ.copy()") or
             pypi.any_file_contains("entrypoint", "json.dumps(os.environ") or
             pypi.any_file_contains("module", "dict(os.environ)") or
             pypi.any_file_contains("module", "str(os.environ)") or
-            pypi.any_file_contains("module", "os.environ.copy()") or
             pypi.any_file_contains("module", "json.dumps(os.environ")
         ) and
         (
@@ -2884,12 +2881,19 @@ rule generic_self_deletion_destructive : malware destructive
         score = 10
         description = "content contains destructive file shredding or mass deletion patterns used as a dead-man switch, as seen in SANDWORM failsafe"
     strings:
+        // Specific enough to stand alone: these appear in real wipers, not
+        // in ordinary docs or examples.
         $shred = "shred -uvz"
         $del_all = "del /F /Q /S \"%USERPROFILE%"
         $cipher_wipe = "cipher /W:"
+        $xargs_shred = "xargs -0 shred"
+        // "rm -rf /" and "rm -rf ~/" turn up in README examples, test
+        // templates, and security-tool keyword lists, so they only count as a
+        // dead-man switch alongside a second destructive marker (the
+        // cross-platform failsafe shape).
         $rm_rf_home = /rm -rf ['"]?~\/?[\s'";)&|]/
         $rm_rf_slash = /rm -rf ['"]?\/\*?[\s'";)&|]/
-        $xargs_shred = "xargs -0 shred"
     condition:
-        1 of them
+        1 of ($shred, $del_all, $cipher_wipe, $xargs_shred) or
+        2 of them
 }

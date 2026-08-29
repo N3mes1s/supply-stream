@@ -69,7 +69,10 @@ impl PriorityViewTracker {
             hidden_leverage: priority.hidden_leverage.unwrap_or_default(),
         };
 
-        let mut state = self.inner.lock().expect("priority view mutex poisoned");
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.entries.len() == state.recent_capacity && state.recent_capacity > 0 {
             state.entries.pop_front();
         }
@@ -79,7 +82,10 @@ impl PriorityViewTracker {
     }
 
     pub fn snapshot(&self, top_limit: usize) -> PriorityViewSnapshot {
-        let state = self.inner.lock().expect("priority view mutex poisoned");
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut priorities = PriorityCounts::default();
         for entry in &state.entries {
             match entry.priority_bucket.as_str() {

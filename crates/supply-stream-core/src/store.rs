@@ -1,16 +1,22 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fs::File,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    time::Duration,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use tokio::task;
+use tokio::{sync::oneshot, task};
 
 use crate::{
     capture::{
@@ -31,6 +37,12 @@ use crate::{
 };
 
 const INDEX_DB: &str = "index.sqlite";
+static INITIALIZED_STORE_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+static OPEN_CONNECTION_COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+const STORE_EVENT_WRITE_BATCH_MAX: usize = 256;
+const STORE_EVENT_WRITE_BATCH_WINDOW: Duration = Duration::from_millis(5);
+const STORE_READ_POOL_SIZE: usize = 4;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS release_index (
     event_id TEXT PRIMARY KEY,
@@ -228,6 +240,13 @@ pub struct ReleaseRecordStatus {
     pub diff_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotStubPackage {
+    pub ecosystem: Ecosystem,
+    pub package: String,
+    pub observations: usize,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct GraphEvidence {
     pub ecosystem: Ecosystem,
@@ -311,15 +330,43 @@ type AggregateCountsRow = (
     i64,
 );
 
-#[derive(Debug, Clone)]
 pub struct OperationalStore {
     path: PathBuf,
+    write_tx: mpsc::Sender<WriteCommand>,
+    read_pool: Arc<Vec<Arc<Mutex<Connection>>>>,
+    next_read_slot: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Debug for OperationalStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperationalStore")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for OperationalStore {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            write_tx: self.write_tx.clone(),
+            read_pool: self.read_pool.clone(),
+            next_read_slot: self.next_read_slot.clone(),
+        }
+    }
 }
 
 impl OperationalStore {
     pub async fn open(path: PathBuf) -> Result<Self> {
-        let store = Self { path };
-        store.init().await?;
+        initialize_store_path(path.clone()).await?;
+        let read_pool = initialize_store_read_pool(path.clone()).await?;
+        let write_tx = start_store_write_worker(path.clone());
+        let store = Self {
+            path,
+            write_tx,
+            read_pool,
+            next_read_slot: Arc::new(AtomicUsize::new(0)),
+        };
         Ok(store)
     }
 
@@ -328,12 +375,7 @@ impl OperationalStore {
     }
 
     pub async fn init(&self) -> Result<()> {
-        let path = self.path.clone();
-        spawn_store_task(move || {
-            let _conn = open_connection(&path)?;
-            Ok(())
-        })
-        .await
+        initialize_store_path(self.path.clone()).await
     }
 
     pub async fn reconcile_local_data(&self, data_dir: &Path) -> Result<ReconcileStats> {
@@ -342,19 +384,40 @@ impl OperationalStore {
         spawn_store_task(move || reconcile_local_data_blocking(&path, &data_dir)).await
     }
 
+    async fn run_read_task<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+    {
+        let read_pool = self.read_pool.clone();
+        let next_read_slot = self.next_read_slot.clone();
+        spawn_store_task(move || {
+            let slot = next_read_slot.fetch_add(1, Ordering::Relaxed) % read_pool.len();
+            let connection = read_pool[slot].clone();
+            let guard = connection
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            f(&guard)
+        })
+        .await
+    }
+
     pub async fn record_event(
         &self,
         event: &PackageReleaseEvent,
         origin: EventOrigin,
     ) -> Result<()> {
-        let path = self.path.clone();
-        let event = event.clone();
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
-            upsert_event_row(&conn, &event, origin)?;
-            Ok(())
-        })
-        .await
+        let (respond_to, response) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::RecordEvent(Box::new(EventWrite {
+                event: event.clone(),
+                origin,
+                respond_to,
+            })))
+            .context("store write worker stopped before recording event")?;
+        response
+            .await
+            .context("store write response dropped while recording event")?
     }
 
     pub async fn record_capture(
@@ -364,27 +427,19 @@ impl OperationalStore {
         capture_dir: &Path,
         capture: &CapturedRelease,
     ) -> Result<()> {
-        let path = self.path.clone();
-        let event = event.clone();
-        let capture_dir = capture_dir.to_path_buf();
-        let capture = capture.clone();
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
-            upsert_event_row(&conn, &event, origin)?;
-            update_capture_row(&conn, &event.event_id, &capture_dir, &capture)?;
-            if let Some(repository) = &capture.upstream_repository {
-                upsert_package_repository_identity(
-                    &conn,
-                    event.ecosystem,
-                    &event.package,
-                    Some(&event.version),
-                    repository,
-                    "capture",
-                )?;
-            }
-            Ok(())
-        })
-        .await
+        let (respond_to, response) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::RecordCapture(Box::new(CaptureWrite {
+                event: event.clone(),
+                origin,
+                capture_dir: capture_dir.to_path_buf(),
+                capture: capture.clone(),
+                respond_to,
+            })))
+            .context("store write worker stopped before recording capture")?;
+        response
+            .await
+            .context("store write response dropped while recording capture")?
     }
 
     pub async fn record_diff(
@@ -394,17 +449,19 @@ impl OperationalStore {
         capture_dir: &Path,
         diff: &StoredReleaseDiff,
     ) -> Result<()> {
-        let path = self.path.clone();
-        let event = event.clone();
-        let capture_dir = capture_dir.to_path_buf();
-        let diff = diff.clone();
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
-            upsert_event_row(&conn, &event, origin)?;
-            update_diff_row(&conn, &event.event_id, &capture_dir, &diff)?;
-            Ok(())
-        })
-        .await
+        let (respond_to, response) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::RecordDiff(Box::new(DiffWrite {
+                event: event.clone(),
+                origin,
+                capture_dir: capture_dir.to_path_buf(),
+                diff: diff.clone(),
+                respond_to,
+            })))
+            .context("store write worker stopped before recording diff")?;
+        response
+            .await
+            .context("store write response dropped while recording diff")?
     }
 
     pub async fn record_package_repository_identity(
@@ -415,24 +472,22 @@ impl OperationalStore {
         repository: &RepositoryReleaseProvenance,
         source: &str,
     ) -> Result<()> {
-        let path = self.path.clone();
-        let package = normalize_package_name(ecosystem, package);
-        let version = version.map(str::to_string);
-        let repository = repository.clone();
-        let source = source.to_string();
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
-            upsert_package_repository_identity(
-                &conn,
-                ecosystem,
-                &package,
-                version.as_deref(),
-                &repository,
-                &source,
-            )?;
-            Ok(())
-        })
-        .await
+        let (respond_to, response) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::RecordRepositoryIdentity(Box::new(
+                RepositoryIdentityWrite {
+                    ecosystem,
+                    package: normalize_package_name(ecosystem, package),
+                    version: version.map(str::to_string),
+                    repository: repository.clone(),
+                    source: source.to_string(),
+                    respond_to,
+                },
+            )))
+            .context("store write worker stopped before recording repository identity")?;
+        response
+            .await
+            .context("store write response dropped while recording repository identity")?
     }
 
     pub async fn record_package_repository_ref(
@@ -440,29 +495,27 @@ impl OperationalStore {
         repository: &RepoPackageRepositoryIdentity,
         version: Option<&str>,
     ) -> Result<()> {
-        let path = self.path.clone();
+        let (respond_to, response) = oneshot::channel();
         let mut repository = repository.clone();
         repository.package = normalize_package_name(repository.ecosystem, &repository.package);
-        let version = version.map(str::to_string);
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
-            upsert_package_repository_ref(
-                &conn,
-                repository.ecosystem,
-                &repository.package,
-                version.as_deref(),
-                &repository,
-            )?;
-            Ok(())
-        })
-        .await
+        self.write_tx
+            .send(WriteCommand::RecordRepositoryRef(Box::new(
+                RepositoryRefWrite {
+                    repository,
+                    version: version.map(str::to_string),
+                    respond_to,
+                },
+            )))
+            .context("store write worker stopped before recording repository ref")?;
+        response
+            .await
+            .context("store write response dropped while recording repository ref")?
     }
 
     pub async fn record_package_repository_refs(
         &self,
         repositories: &[RepoPackageRepositoryIdentity],
     ) -> Result<()> {
-        let path = self.path.clone();
         let repositories = repositories
             .iter()
             .cloned()
@@ -472,85 +525,78 @@ impl OperationalStore {
                 repository
             })
             .collect::<Vec<_>>();
-        spawn_store_task(move || {
-            let mut conn = open_connection(&path)?;
-            let tx = conn.transaction()?;
-            for repository in &repositories {
-                upsert_package_repository_ref(
-                    &tx,
-                    repository.ecosystem,
-                    &repository.package,
-                    None,
-                    repository,
-                )?;
-            }
-            tx.commit()?;
-            Ok(())
-        })
-        .await
+        let (respond_to, response) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::RecordRepositoryRefs(Box::new(
+                RepositoryRefsWrite {
+                    repositories,
+                    respond_to,
+                },
+            )))
+            .context("store write worker stopped before recording repository refs")?;
+        response
+            .await
+            .context("store write response dropped while recording repository refs")?
     }
 
     pub async fn mark_capture_failed(&self, event_id: &str, reason: &str) -> Result<()> {
-        let path = self.path.clone();
-        let event_id = event_id.to_string();
-        let reason = reason.to_string();
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
-            conn.execute(
-                "UPDATE release_index
-                 SET capture_state = 'failed',
-                     capture_reason = ?2,
-                     capture_updated_at = ?3
-                 WHERE event_id = ?1",
-                params![event_id, reason, Utc::now().to_rfc3339()],
-            )?;
-            Ok(())
-        })
-        .await
+        let (respond_to, response) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::MarkCaptureFailed(MarkFailureWrite {
+                event_id: event_id.to_string(),
+                reason: reason.to_string(),
+                respond_to,
+            }))
+            .context("store write worker stopped before marking capture failed")?;
+        response
+            .await
+            .context("store write response dropped while marking capture failed")?
+    }
+
+    pub async fn mark_capture_skipped(&self, event_id: &str, reason: &str) -> Result<()> {
+        let (respond_to, response) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::MarkCaptureSkipped(MarkFailureWrite {
+                event_id: event_id.to_string(),
+                reason: reason.to_string(),
+                respond_to,
+            }))
+            .context("store write worker stopped before marking capture skipped")?;
+        response
+            .await
+            .context("store write response dropped while marking capture skipped")?
     }
 
     pub async fn mark_diff_failed(&self, event_id: &str, reason: &str) -> Result<()> {
-        let path = self.path.clone();
-        let event_id = event_id.to_string();
-        let reason = reason.to_string();
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
-            conn.execute(
-                "UPDATE release_index
-                 SET diff_state = 'failed',
-                     diff_reason = ?2,
-                     diff_updated_at = ?3
-                 WHERE event_id = ?1",
-                params![event_id, reason, Utc::now().to_rfc3339()],
-            )?;
-            Ok(())
-        })
-        .await
+        let (respond_to, response) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::MarkDiffFailed(MarkFailureWrite {
+                event_id: event_id.to_string(),
+                reason: reason.to_string(),
+                respond_to,
+            }))
+            .context("store write worker stopped before marking diff failed")?;
+        response
+            .await
+            .context("store write response dropped while marking diff failed")?
     }
 
     pub async fn mark_diff_skipped(&self, event_id: &str, reason: &str) -> Result<()> {
-        let path = self.path.clone();
-        let event_id = event_id.to_string();
-        let reason = reason.to_string();
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
-            conn.execute(
-                "UPDATE release_index
-                 SET diff_state = 'skipped',
-                     diff_reason = ?2,
-                     diff_updated_at = ?3
-                 WHERE event_id = ?1",
-                params![event_id, reason, Utc::now().to_rfc3339()],
-            )?;
-            Ok(())
-        })
-        .await
+        let (respond_to, response) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::MarkDiffSkipped(MarkFailureWrite {
+                event_id: event_id.to_string(),
+                reason: reason.to_string(),
+                respond_to,
+            }))
+            .context("store write worker stopped before marking diff skipped")?;
+        response
+            .await
+            .context("store write response dropped while marking diff skipped")?
     }
 
     pub async fn event_count(&self) -> Result<usize> {
-        let path = self.path.clone();
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
+        self.run_read_task(move |conn| {
             let count: i64 =
                 conn.query_row("SELECT COUNT(*) FROM release_index", [], |row| row.get(0))?;
             usize::try_from(count).context("event count exceeds usize range")
@@ -563,10 +609,8 @@ impl OperationalStore {
         ecosystem: Ecosystem,
         package: &str,
     ) -> Result<Vec<PackageReleaseEvent>> {
-        let path = self.path.clone();
         let package = package.to_string();
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
+        self.run_read_task(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version
                  FROM release_index
@@ -584,10 +628,8 @@ impl OperationalStore {
     }
 
     pub async fn load_event(&self, event_id: &str) -> Result<Option<PackageReleaseEvent>> {
-        let path = self.path.clone();
         let event_id = event_id.to_string();
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
+        self.run_read_task(move |conn| {
             conn.query_row(
                 "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version
                  FROM release_index
@@ -602,10 +644,8 @@ impl OperationalStore {
     }
 
     pub async fn load_release_record(&self, event_id: &str) -> Result<Option<ReleaseRecordStatus>> {
-        let path = self.path.clone();
         let event_id = event_id.to_string();
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
+        self.run_read_task(move |conn| {
             conn.query_row(
                 "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
                  FROM release_index
@@ -624,9 +664,7 @@ impl OperationalStore {
         ecosystem: Option<Ecosystem>,
         limit: usize,
     ) -> Result<Vec<PackageReleaseEvent>> {
-        let path = self.path.clone();
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
+        self.run_read_task(move |conn| {
             let limit = i64::try_from(limit).context("recent limit exceeds sqlite range")?;
             let mut events = Vec::new();
 
@@ -660,10 +698,474 @@ impl OperationalStore {
         .await
     }
 
+    pub async fn load_release_records_since(
+        &self,
+        ecosystem: Option<Ecosystem>,
+        since: DateTime<Utc>,
+        limit: Option<usize>,
+    ) -> Result<Vec<ReleaseRecordStatus>> {
+        self.run_read_task(move |conn| {
+            let since = since.to_rfc3339();
+            let limit = limit
+                .map(|value| i64::try_from(value).context("report limit exceeds sqlite range"))
+                .transpose()?;
+            let mut records = Vec::new();
+
+            match (ecosystem, limit) {
+                (Some(ecosystem), Some(limit)) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE ecosystem = ?1 AND observed_at >= ?2
+                         ORDER BY observed_at DESC, event_id DESC
+                         LIMIT ?3",
+                    )?;
+                    let rows = stmt.query_map(
+                        params![ecosystem.as_str(), since, limit],
+                        release_record_from_row,
+                    )?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+                (Some(ecosystem), None) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE ecosystem = ?1 AND observed_at >= ?2
+                         ORDER BY observed_at DESC, event_id DESC",
+                    )?;
+                    let rows =
+                        stmt.query_map(params![ecosystem.as_str(), since], release_record_from_row)?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+                (None, Some(limit)) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE observed_at >= ?1
+                         ORDER BY observed_at DESC, event_id DESC
+                         LIMIT ?2",
+                    )?;
+                    let rows = stmt.query_map(params![since, limit], release_record_from_row)?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+                (None, None) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE observed_at >= ?1
+                         ORDER BY observed_at DESC, event_id DESC",
+                    )?;
+                    let rows = stmt.query_map(params![since], release_record_from_row)?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+            }
+
+            Ok(records)
+        })
+        .await
+    }
+
+    pub async fn load_failed_capture_records(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<ReleaseRecordStatus>> {
+        self.run_read_task(move |conn| {
+            let limit = limit
+                .map(|value| i64::try_from(value).context("failed capture limit exceeds sqlite range"))
+                .transpose()?;
+            let mut records = Vec::new();
+
+            match limit {
+                Some(limit) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE capture_state = 'failed'
+                         ORDER BY COALESCE(capture_updated_at, observed_at) DESC, event_id DESC
+                         LIMIT ?1",
+                    )?;
+                    let rows = stmt.query_map(params![limit], release_record_from_row)?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+                None => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE capture_state = 'failed'
+                         ORDER BY COALESCE(capture_updated_at, observed_at) DESC, event_id DESC",
+                    )?;
+                    let rows = stmt.query_map([], release_record_from_row)?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+            }
+
+            Ok(records)
+        })
+        .await
+    }
+
+    pub async fn load_skipped_capture_records(
+        &self,
+        ecosystem: Option<Ecosystem>,
+        package: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        limit: Option<usize>,
+    ) -> Result<Vec<ReleaseRecordStatus>> {
+        let package = package.map(|value| match ecosystem {
+            Some(ecosystem) => normalize_package_name(ecosystem, value),
+            None => value.to_string(),
+        });
+        self.run_read_task(move |conn| {
+            let limit = limit
+                .map(|value| i64::try_from(value).context("skipped capture limit exceeds sqlite range"))
+                .transpose()?;
+            let since = since.map(|value| value.to_rfc3339());
+            let ecosystem = ecosystem.map(|value| value.as_str().to_string());
+            let package = package;
+            let mut records = Vec::new();
+
+            match (ecosystem.as_deref(), package.as_deref(), since.as_deref(), limit) {
+                (Some(ecosystem), Some(package), Some(since), Some(limit)) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE origin = 'observed'
+                           AND capture_state = 'skipped'
+                           AND capture_reason = 'priority policy skipped capture'
+                           AND ecosystem = ?1
+                           AND package = ?2
+                           AND observed_at >= ?3
+                         ORDER BY observed_at DESC, event_id DESC
+                         LIMIT ?4",
+                    )?;
+                    let rows = stmt.query_map(
+                        params![ecosystem, package, since, limit],
+                        release_record_from_row,
+                    )?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+                (Some(ecosystem), Some(package), Some(since), None) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE origin = 'observed'
+                           AND capture_state = 'skipped'
+                           AND capture_reason = 'priority policy skipped capture'
+                           AND ecosystem = ?1
+                           AND package = ?2
+                           AND observed_at >= ?3
+                         ORDER BY observed_at DESC, event_id DESC",
+                    )?;
+                    let rows = stmt.query_map(
+                        params![ecosystem, package, since],
+                        release_record_from_row,
+                    )?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+                (Some(ecosystem), Some(package), None, Some(limit)) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE origin = 'observed'
+                           AND capture_state = 'skipped'
+                           AND capture_reason = 'priority policy skipped capture'
+                           AND ecosystem = ?1
+                           AND package = ?2
+                         ORDER BY observed_at DESC, event_id DESC
+                         LIMIT ?3",
+                    )?;
+                    let rows = stmt.query_map(
+                        params![ecosystem, package, limit],
+                        release_record_from_row,
+                    )?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+                (Some(ecosystem), Some(package), None, None) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE origin = 'observed'
+                           AND capture_state = 'skipped'
+                           AND capture_reason = 'priority policy skipped capture'
+                           AND ecosystem = ?1
+                           AND package = ?2
+                         ORDER BY observed_at DESC, event_id DESC",
+                    )?;
+                    let rows =
+                        stmt.query_map(params![ecosystem, package], release_record_from_row)?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+                (Some(ecosystem), None, Some(since), Some(limit)) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE origin = 'observed'
+                           AND capture_state = 'skipped'
+                           AND capture_reason = 'priority policy skipped capture'
+                           AND ecosystem = ?1
+                           AND observed_at >= ?2
+                         ORDER BY observed_at DESC, event_id DESC
+                         LIMIT ?3",
+                    )?;
+                    let rows =
+                        stmt.query_map(params![ecosystem, since, limit], release_record_from_row)?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+                (Some(ecosystem), None, Some(since), None) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE origin = 'observed'
+                           AND capture_state = 'skipped'
+                           AND capture_reason = 'priority policy skipped capture'
+                           AND ecosystem = ?1
+                           AND observed_at >= ?2
+                         ORDER BY observed_at DESC, event_id DESC",
+                    )?;
+                    let rows =
+                        stmt.query_map(params![ecosystem, since], release_record_from_row)?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+                (Some(ecosystem), None, None, Some(limit)) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE origin = 'observed'
+                           AND capture_state = 'skipped'
+                           AND capture_reason = 'priority policy skipped capture'
+                           AND ecosystem = ?1
+                         ORDER BY observed_at DESC, event_id DESC
+                         LIMIT ?2",
+                    )?;
+                    let rows =
+                        stmt.query_map(params![ecosystem, limit], release_record_from_row)?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+                (Some(ecosystem), None, None, None) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE origin = 'observed'
+                           AND capture_state = 'skipped'
+                           AND capture_reason = 'priority policy skipped capture'
+                           AND ecosystem = ?1
+                         ORDER BY observed_at DESC, event_id DESC",
+                    )?;
+                    let rows = stmt.query_map(params![ecosystem], release_record_from_row)?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+                (None, Some(package), Some(since), Some(limit)) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE origin = 'observed'
+                           AND capture_state = 'skipped'
+                           AND capture_reason = 'priority policy skipped capture'
+                           AND package = ?1
+                           AND observed_at >= ?2
+                         ORDER BY observed_at DESC, event_id DESC
+                         LIMIT ?3",
+                    )?;
+                    let rows =
+                        stmt.query_map(params![package, since, limit], release_record_from_row)?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+                (None, Some(package), Some(since), None) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE origin = 'observed'
+                           AND capture_state = 'skipped'
+                           AND capture_reason = 'priority policy skipped capture'
+                           AND package = ?1
+                           AND observed_at >= ?2
+                         ORDER BY observed_at DESC, event_id DESC",
+                    )?;
+                    let rows = stmt.query_map(params![package, since], release_record_from_row)?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+                (None, Some(package), None, Some(limit)) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE origin = 'observed'
+                           AND capture_state = 'skipped'
+                           AND capture_reason = 'priority policy skipped capture'
+                           AND package = ?1
+                         ORDER BY observed_at DESC, event_id DESC
+                         LIMIT ?2",
+                    )?;
+                    let rows = stmt.query_map(params![package, limit], release_record_from_row)?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+                (None, Some(package), None, None) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE origin = 'observed'
+                           AND capture_state = 'skipped'
+                           AND capture_reason = 'priority policy skipped capture'
+                           AND package = ?1
+                         ORDER BY observed_at DESC, event_id DESC",
+                    )?;
+                    let rows = stmt.query_map(params![package], release_record_from_row)?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+                (None, None, Some(since), Some(limit)) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE origin = 'observed'
+                           AND capture_state = 'skipped'
+                           AND capture_reason = 'priority policy skipped capture'
+                           AND observed_at >= ?1
+                         ORDER BY observed_at DESC, event_id DESC
+                         LIMIT ?2",
+                    )?;
+                    let rows = stmt.query_map(params![since, limit], release_record_from_row)?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+                (None, None, Some(since), None) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE origin = 'observed'
+                           AND capture_state = 'skipped'
+                           AND capture_reason = 'priority policy skipped capture'
+                           AND observed_at >= ?1
+                         ORDER BY observed_at DESC, event_id DESC",
+                    )?;
+                    let rows = stmt.query_map(params![since], release_record_from_row)?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+                (None, None, None, Some(limit)) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE origin = 'observed'
+                           AND capture_state = 'skipped'
+                           AND capture_reason = 'priority policy skipped capture'
+                         ORDER BY observed_at DESC, event_id DESC
+                         LIMIT ?1",
+                    )?;
+                    let rows = stmt.query_map(params![limit], release_record_from_row)?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+                (None, None, None, None) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, ecosystem, package, version, published_at, observed_at, source, sequence, package_url, release_url, metadata_url, priority_tier, priority_source, direct_popularity, propagated_impact, hidden_leverage, priority_computed_at, priority_score_source_version, origin, capture_state, capture_status, capture_dir, capture_reason, diff_state, diff_status, diff_path, diff_reason
+                         FROM release_index
+                         WHERE origin = 'observed'
+                           AND capture_state = 'skipped'
+                           AND capture_reason = 'priority policy skipped capture'
+                         ORDER BY observed_at DESC, event_id DESC",
+                    )?;
+                    let rows = stmt.query_map([], release_record_from_row)?;
+                    for row in rows {
+                        records.push(row?);
+                    }
+                }
+            }
+
+            Ok(records)
+        })
+        .await
+    }
+
+    pub async fn load_hot_stub_packages(
+        &self,
+        ecosystems: &[Ecosystem],
+        since: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<HotStubPackage>> {
+        let ecosystems = ecosystems.to_vec();
+        self.run_read_task(move |conn| {
+            let since = since.to_rfc3339();
+            let limit = i64::try_from(limit).context("hot stub limit exceeds sqlite range")?;
+            let mut packages = Vec::new();
+            let mut stmt = conn.prepare(
+                "SELECT ecosystem, package, COUNT(*) AS observations
+                 FROM release_index
+                 WHERE origin = 'observed'
+                   AND priority_source = 'known_package_stub'
+                   AND observed_at >= ?1
+                   AND ecosystem = ?2
+                 GROUP BY ecosystem, package
+                 ORDER BY observations DESC, MAX(observed_at) DESC, package ASC
+                 LIMIT ?3",
+            )?;
+            for ecosystem in ecosystems {
+                let rows = stmt.query_map(
+                    params![since, ecosystem.as_str(), limit],
+                    |row| -> rusqlite::Result<HotStubPackage> {
+                        Ok(HotStubPackage {
+                            ecosystem,
+                            package: normalize_package_name(ecosystem, &row.get::<_, String>(1)?),
+                            observations: row.get::<_, i64>(2)? as usize,
+                        })
+                    },
+                )?;
+                for row in rows {
+                    packages.push(row?);
+                }
+            }
+            packages.sort_by(|left, right| {
+                right
+                    .observations
+                    .cmp(&left.observations)
+                    .then_with(|| left.ecosystem.as_str().cmp(right.ecosystem.as_str()))
+                    .then_with(|| left.package.cmp(&right.package))
+            });
+            packages.truncate(limit as usize);
+            Ok(packages)
+        })
+        .await
+    }
+
     pub async fn stats(&self) -> Result<StoreStats> {
-        let path = self.path.clone();
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
+        self.run_read_task(move |conn| {
             let (
                 total_events,
                 observed_events,
@@ -808,18 +1310,18 @@ impl OperationalStore {
     }
 
     pub async fn record_graph_records(&self, records: &[ScoreInputRecord]) -> Result<()> {
-        let path = self.path.clone();
-        let records = records.to_vec();
-        spawn_store_task(move || {
-            let mut conn = open_connection(&path)?;
-            let tx = conn.transaction()?;
-            for record in records {
-                upsert_graph_record(&tx, &record)?;
-            }
-            tx.commit()?;
-            Ok(())
-        })
-        .await
+        let (respond_to, response) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::RecordGraphRecords(Box::new(
+                GraphRecordsWrite {
+                    records: records.to_vec(),
+                    respond_to,
+                },
+            )))
+            .context("store write worker stopped before recording graph rows")?;
+        response
+            .await
+            .context("store write response dropped while recording graph rows")?
     }
 
     pub async fn load_graph_evidence(
@@ -827,11 +1329,9 @@ impl OperationalStore {
         ecosystem: Ecosystem,
         package: &str,
     ) -> Result<Option<GraphEvidence>> {
-        let path = self.path.clone();
         let package = normalize_package_name(ecosystem, package);
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
-            let evidence = load_graph_evidence_blocking(&conn, ecosystem, &package)?;
+        self.run_read_task(move |conn| {
+            let evidence = load_graph_evidence_blocking(conn, ecosystem, &package)?;
             Ok(evidence)
         })
         .await
@@ -843,11 +1343,9 @@ impl OperationalStore {
         package: &str,
         limit: usize,
     ) -> Result<Option<GraphNeighborhood>> {
-        let path = self.path.clone();
         let package = normalize_package_name(ecosystem, package);
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
-            let neighborhood = load_graph_neighborhood_blocking(&conn, ecosystem, &package, limit)?;
+        self.run_read_task(move |conn| {
+            let neighborhood = load_graph_neighborhood_blocking(conn, ecosystem, &package, limit)?;
             Ok(neighborhood)
         })
         .await
@@ -858,11 +1356,9 @@ impl OperationalStore {
         ecosystem: Ecosystem,
         package: &str,
     ) -> Result<Option<PackageRepositoryIdentity>> {
-        let path = self.path.clone();
         let package = normalize_package_name(ecosystem, package);
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
-            let repository = load_package_repository_identity_blocking(&conn, ecosystem, &package)?;
+        self.run_read_task(move |conn| {
+            let repository = load_package_repository_identity_blocking(conn, ecosystem, &package)?;
             Ok(repository)
         })
         .await
@@ -874,15 +1370,13 @@ impl OperationalStore {
         roots: &[String],
         per_root_limit: usize,
     ) -> Result<GraphNeighborhoodRecords> {
-        let path = self.path.clone();
         let roots = roots
             .iter()
             .map(|root| normalize_package_name(ecosystem, root))
             .collect::<Vec<_>>();
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
+        self.run_read_task(move |conn| {
             let records =
-                load_graph_records_for_roots_blocking(&conn, ecosystem, &roots, per_root_limit)?;
+                load_graph_records_for_roots_blocking(conn, ecosystem, &roots, per_root_limit)?;
             Ok(records)
         })
         .await
@@ -892,58 +1386,41 @@ impl OperationalStore {
         &self,
         ecosystems: &[Ecosystem],
     ) -> Result<BTreeSet<(Ecosystem, String)>> {
-        let path = self.path.clone();
         let ecosystems = ecosystems.to_vec();
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
-            load_known_graph_packages_blocking(&conn, &ecosystems)
-        })
-        .await
+        self.run_read_task(move |conn| load_known_graph_packages_blocking(conn, &ecosystems))
+            .await
     }
 
     pub async fn graph_stats(&self) -> Result<GraphStoreStats> {
-        let path = self.path.clone();
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
-            load_graph_store_stats_blocking(&conn)
-        })
-        .await
+        self.run_read_task(load_graph_store_stats_blocking).await
     }
 
     pub async fn record_priority_score_records(
         &self,
         records: &[PriorityScoreRecord],
     ) -> Result<()> {
-        let path = self.path.clone();
-        let records = records.to_vec();
-        spawn_store_task(move || {
-            let mut conn = open_connection(&path)?;
-            let tx = conn.transaction()?;
-            for record in &records {
-                upsert_priority_score_record(&tx, record)?;
-            }
-            tx.commit()?;
-            Ok(())
-        })
-        .await
+        let (respond_to, response) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::RecordPriorityScoreRecords(Box::new(
+                PriorityScoreRecordsWrite {
+                    records: records.to_vec(),
+                    respond_to,
+                },
+            )))
+            .context("store write worker stopped before recording priority scores")?;
+        response
+            .await
+            .context("store write response dropped while recording priority scores")?
     }
 
     pub async fn load_priority_score_records(&self) -> Result<Vec<PriorityScoreRecord>> {
-        let path = self.path.clone();
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
-            load_priority_score_records_blocking(&conn)
-        })
-        .await
+        self.run_read_task(load_priority_score_records_blocking)
+            .await
     }
 
     pub async fn priority_score_stats(&self) -> Result<PriorityScoreStoreStats> {
-        let path = self.path.clone();
-        spawn_store_task(move || {
-            let conn = open_connection(&path)?;
-            load_priority_score_store_stats_blocking(&conn)
-        })
-        .await
+        self.run_read_task(load_priority_score_store_stats_blocking)
+            .await
     }
 }
 
@@ -961,6 +1438,369 @@ where
         .context("store task join failed")?
 }
 
+async fn initialize_store_path(path: PathBuf) -> Result<()> {
+    spawn_store_task(move || {
+        let _conn = open_connection(&path)?;
+        Ok(())
+    })
+    .await
+}
+
+async fn initialize_store_read_pool(path: PathBuf) -> Result<Arc<Vec<Arc<Mutex<Connection>>>>> {
+    spawn_store_task(move || {
+        let mut connections = Vec::with_capacity(STORE_READ_POOL_SIZE);
+        for _ in 0..STORE_READ_POOL_SIZE {
+            connections.push(Arc::new(Mutex::new(open_connection(&path)?)));
+        }
+        Ok(Arc::new(connections))
+    })
+    .await
+}
+
+type WriteResponse = oneshot::Sender<Result<()>>;
+
+enum WriteCommand {
+    RecordEvent(Box<EventWrite>),
+    RecordCapture(Box<CaptureWrite>),
+    RecordDiff(Box<DiffWrite>),
+    RecordRepositoryIdentity(Box<RepositoryIdentityWrite>),
+    RecordRepositoryRef(Box<RepositoryRefWrite>),
+    RecordRepositoryRefs(Box<RepositoryRefsWrite>),
+    MarkCaptureSkipped(MarkFailureWrite),
+    MarkCaptureFailed(MarkFailureWrite),
+    MarkDiffFailed(MarkFailureWrite),
+    MarkDiffSkipped(MarkFailureWrite),
+    RecordGraphRecords(Box<GraphRecordsWrite>),
+    RecordPriorityScoreRecords(Box<PriorityScoreRecordsWrite>),
+}
+
+struct EventWrite {
+    event: PackageReleaseEvent,
+    origin: EventOrigin,
+    respond_to: WriteResponse,
+}
+
+struct CaptureWrite {
+    event: PackageReleaseEvent,
+    origin: EventOrigin,
+    capture_dir: PathBuf,
+    capture: CapturedRelease,
+    respond_to: WriteResponse,
+}
+
+struct DiffWrite {
+    event: PackageReleaseEvent,
+    origin: EventOrigin,
+    capture_dir: PathBuf,
+    diff: StoredReleaseDiff,
+    respond_to: WriteResponse,
+}
+
+struct RepositoryIdentityWrite {
+    ecosystem: Ecosystem,
+    package: String,
+    version: Option<String>,
+    repository: RepositoryReleaseProvenance,
+    source: String,
+    respond_to: WriteResponse,
+}
+
+struct RepositoryRefWrite {
+    repository: RepoPackageRepositoryIdentity,
+    version: Option<String>,
+    respond_to: WriteResponse,
+}
+
+struct RepositoryRefsWrite {
+    repositories: Vec<RepoPackageRepositoryIdentity>,
+    respond_to: WriteResponse,
+}
+
+struct MarkFailureWrite {
+    event_id: String,
+    reason: String,
+    respond_to: WriteResponse,
+}
+
+struct GraphRecordsWrite {
+    records: Vec<ScoreInputRecord>,
+    respond_to: WriteResponse,
+}
+
+struct PriorityScoreRecordsWrite {
+    records: Vec<PriorityScoreRecord>,
+    respond_to: WriteResponse,
+}
+
+fn start_store_write_worker(path: PathBuf) -> mpsc::Sender<WriteCommand> {
+    let (tx, rx) = mpsc::channel::<WriteCommand>();
+    thread::Builder::new()
+        .name("supply-stream-store-writer".to_string())
+        .spawn(move || run_store_write_worker(path, rx))
+        .expect("failed to spawn store write worker");
+    tx
+}
+
+fn run_store_write_worker(path: PathBuf, receiver: mpsc::Receiver<WriteCommand>) {
+    let mut conn = match open_connection(&path) {
+        Ok(conn) => conn,
+        Err(_) => return,
+    };
+    let mut pending = None;
+
+    loop {
+        let Some(command) = next_write_command(&receiver, &mut pending) else {
+            break;
+        };
+        match command {
+            WriteCommand::RecordEvent(first) => {
+                let (batch, disconnected) =
+                    collect_event_write_batch(*first, &receiver, &mut pending);
+                respond_to_event_batch(&mut conn, batch);
+                if disconnected {
+                    break;
+                }
+            }
+            other => respond_to_single_write(execute_write_command(&mut conn, other)),
+        }
+    }
+}
+
+fn next_write_command(
+    receiver: &mpsc::Receiver<WriteCommand>,
+    pending: &mut Option<WriteCommand>,
+) -> Option<WriteCommand> {
+    if let Some(command) = pending.take() {
+        return Some(command);
+    }
+    receiver.recv().ok()
+}
+
+fn collect_event_write_batch(
+    first: EventWrite,
+    receiver: &mpsc::Receiver<WriteCommand>,
+    pending: &mut Option<WriteCommand>,
+) -> (Vec<EventWrite>, bool) {
+    let mut batch = vec![first];
+    let deadline = Instant::now() + STORE_EVENT_WRITE_BATCH_WINDOW;
+    let mut disconnected = false;
+
+    while batch.len() < STORE_EVENT_WRITE_BATCH_MAX {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            break;
+        }
+        match receiver.recv_timeout(timeout) {
+            Ok(WriteCommand::RecordEvent(command)) => batch.push(*command),
+            Ok(other) => {
+                *pending = Some(other);
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                disconnected = true;
+                break;
+            }
+        }
+    }
+
+    (batch, disconnected)
+}
+
+fn respond_to_event_batch(conn: &mut Connection, batch: Vec<EventWrite>) {
+    let result = execute_event_write_batch(conn, &batch).map_err(|error| error.to_string());
+    for command in batch {
+        let _ = command.respond_to.send(match &result {
+            Ok(()) => Ok(()),
+            Err(message) => Err(anyhow::anyhow!(message.clone())),
+        });
+    }
+}
+
+fn respond_to_single_write((respond_to, result): (WriteResponse, Result<()>)) {
+    let _ = respond_to.send(result);
+}
+
+fn execute_event_write_batch(conn: &mut Connection, batch: &[EventWrite]) -> Result<()> {
+    let tx = conn.transaction()?;
+    for command in batch {
+        upsert_event_row(&tx, &command.event, command.origin)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn execute_write_command(
+    conn: &mut Connection,
+    command: WriteCommand,
+) -> (WriteResponse, Result<()>) {
+    match command {
+        WriteCommand::RecordEvent(command) => {
+            let result = upsert_event_row(conn, &command.event, command.origin);
+            (command.respond_to, result)
+        }
+        WriteCommand::RecordCapture(command) => {
+            let result = (|| -> Result<()> {
+                let tx = conn.transaction()?;
+                upsert_event_row(&tx, &command.event, command.origin)?;
+                update_capture_row(
+                    &tx,
+                    &command.event.event_id,
+                    &command.capture_dir,
+                    &command.capture,
+                )?;
+                if let Some(repository) = &command.capture.upstream_repository {
+                    upsert_package_repository_identity(
+                        &tx,
+                        command.event.ecosystem,
+                        &command.event.package,
+                        Some(&command.event.version),
+                        repository,
+                        "capture",
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            })();
+            (command.respond_to, result)
+        }
+        WriteCommand::RecordDiff(command) => {
+            let result = (|| -> Result<()> {
+                let tx = conn.transaction()?;
+                upsert_event_row(&tx, &command.event, command.origin)?;
+                update_diff_row(
+                    &tx,
+                    &command.event.event_id,
+                    &command.capture_dir,
+                    &command.diff,
+                )?;
+                tx.commit()?;
+                Ok(())
+            })();
+            (command.respond_to, result)
+        }
+        WriteCommand::RecordRepositoryIdentity(command) => {
+            let result = upsert_package_repository_identity(
+                conn,
+                command.ecosystem,
+                &command.package,
+                command.version.as_deref(),
+                &command.repository,
+                &command.source,
+            );
+            (command.respond_to, result)
+        }
+        WriteCommand::RecordRepositoryRef(command) => {
+            let result = upsert_package_repository_ref(
+                conn,
+                command.repository.ecosystem,
+                &command.repository.package,
+                command.version.as_deref(),
+                &command.repository,
+            );
+            (command.respond_to, result)
+        }
+        WriteCommand::RecordRepositoryRefs(command) => {
+            let result = (|| -> Result<()> {
+                let tx = conn.transaction()?;
+                for repository in &command.repositories {
+                    upsert_package_repository_ref(
+                        &tx,
+                        repository.ecosystem,
+                        &repository.package,
+                        None,
+                        repository,
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            })();
+            (command.respond_to, result)
+        }
+        WriteCommand::MarkCaptureFailed(command) => {
+            let result = conn
+                .execute(
+                    "UPDATE release_index
+                 SET capture_state = 'failed',
+                     capture_reason = ?2,
+                     capture_updated_at = ?3
+                 WHERE event_id = ?1",
+                    params![command.event_id, command.reason, Utc::now().to_rfc3339()],
+                )
+                .map(|_| ())
+                .map_err(anyhow::Error::from);
+            (command.respond_to, result)
+        }
+        WriteCommand::MarkCaptureSkipped(command) => {
+            let result = conn
+                .execute(
+                    "UPDATE release_index
+                 SET capture_state = 'skipped',
+                     capture_status = NULL,
+                     capture_artifact_count = NULL,
+                     capture_dir = NULL,
+                     capture_reason = ?2,
+                     capture_updated_at = ?3
+                 WHERE event_id = ?1",
+                    params![command.event_id, command.reason, Utc::now().to_rfc3339()],
+                )
+                .map(|_| ())
+                .map_err(anyhow::Error::from);
+            (command.respond_to, result)
+        }
+        WriteCommand::MarkDiffFailed(command) => {
+            let result = conn
+                .execute(
+                    "UPDATE release_index
+                 SET diff_state = 'failed',
+                     diff_reason = ?2,
+                     diff_updated_at = ?3
+                 WHERE event_id = ?1",
+                    params![command.event_id, command.reason, Utc::now().to_rfc3339()],
+                )
+                .map(|_| ())
+                .map_err(anyhow::Error::from);
+            (command.respond_to, result)
+        }
+        WriteCommand::MarkDiffSkipped(command) => {
+            let result = conn
+                .execute(
+                    "UPDATE release_index
+                 SET diff_state = 'skipped',
+                     diff_reason = ?2,
+                     diff_updated_at = ?3
+                 WHERE event_id = ?1",
+                    params![command.event_id, command.reason, Utc::now().to_rfc3339()],
+                )
+                .map(|_| ())
+                .map_err(anyhow::Error::from);
+            (command.respond_to, result)
+        }
+        WriteCommand::RecordGraphRecords(command) => {
+            let result = (|| -> Result<()> {
+                let tx = conn.transaction()?;
+                for record in &command.records {
+                    upsert_graph_record(&tx, record)?;
+                }
+                tx.commit()?;
+                Ok(())
+            })();
+            (command.respond_to, result)
+        }
+        WriteCommand::RecordPriorityScoreRecords(command) => {
+            let result = (|| -> Result<()> {
+                let tx = conn.transaction()?;
+                for record in &command.records {
+                    upsert_priority_score_record(&tx, record)?;
+                }
+                tx.commit()?;
+                Ok(())
+            })();
+            (command.respond_to, result)
+        }
+    }
+}
+
 fn open_connection(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -969,11 +1809,60 @@ fn open_connection(path: &Path) -> Result<Connection> {
 
     let conn = Connection::open(path)
         .with_context(|| format!("failed to open sqlite store {}", path.display()))?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.busy_timeout(Duration::from_secs(5))?;
-    ensure_schema(&conn)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "cache_size", -20_000i64)?;
+    if store_path_needs_initialization(path)? {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        ensure_schema(&conn)?;
+        mark_store_path_initialized(path)?;
+    }
+    record_open_connection_for_test(path);
     Ok(conn)
+}
+
+#[cfg(test)]
+fn open_connection_counts() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    OPEN_CONNECTION_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn record_open_connection_for_test(path: &Path) {
+    let mut counts = open_connection_counts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *counts.entry(path.to_path_buf()).or_insert(0) += 1;
+}
+
+#[cfg(not(test))]
+fn record_open_connection_for_test(_path: &Path) {}
+
+#[cfg(test)]
+fn opened_connection_count_for_test(path: &Path) -> usize {
+    let counts = open_connection_counts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    counts.get(path).copied().unwrap_or_default()
+}
+
+fn initialized_store_paths() -> &'static Mutex<HashSet<PathBuf>> {
+    INITIALIZED_STORE_PATHS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn store_path_needs_initialization(path: &Path) -> Result<bool> {
+    let paths = initialized_store_paths()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("store init mutex poisoned"))?;
+    Ok(!paths.contains(path))
+}
+
+fn mark_store_path_initialized(path: &Path) -> Result<()> {
+    let mut paths = initialized_store_paths()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("store init mutex poisoned"))?;
+    paths.insert(path.to_path_buf());
+    Ok(())
 }
 
 fn ensure_schema(conn: &Connection) -> Result<()> {
@@ -1518,57 +2407,35 @@ fn load_graph_evidence_blocking(
     ecosystem: Ecosystem,
     package: &str,
 ) -> Result<Option<GraphEvidence>> {
-    let direct_popularity: f64 = conn.query_row(
-        "SELECT COALESCE(
+    let (direct_popularity, direct_dependencies_seen, reverse_dependents_seen): (
+        Option<f64>,
+        i64,
+        i64,
+    ) = conn.query_row(
+        "SELECT
             (SELECT direct_popularity
              FROM graph_package_index
              WHERE ecosystem = ?1 AND package = ?2),
-            0
-         )",
+            (SELECT COUNT(*)
+             FROM graph_edge_index
+             WHERE ecosystem = ?1 AND package = ?2),
+            (SELECT COUNT(*)
+             FROM graph_edge_index
+             WHERE ecosystem = ?1 AND dependency = ?2)",
         params![ecosystem.as_str(), package],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
-    let direct_dependencies_seen: i64 = conn.query_row(
-        "SELECT COUNT(*)
-         FROM graph_edge_index
-         WHERE ecosystem = ?1 AND package = ?2",
-        params![ecosystem.as_str(), package],
-        |row| row.get(0),
-    )?;
-    let reverse_dependents_seen: i64 = conn.query_row(
-        "SELECT COUNT(*)
-         FROM graph_edge_index
-         WHERE ecosystem = ?1 AND dependency = ?2",
-        params![ecosystem.as_str(), package],
-        |row| row.get(0),
-    )?;
-    let known: i64 = conn.query_row(
-        "SELECT CASE
-            WHEN EXISTS(
-                SELECT 1
-                FROM graph_package_index
-                WHERE ecosystem = ?1 AND package = ?2
-            ) OR EXISTS(
-                SELECT 1
-                FROM graph_edge_index
-                WHERE ecosystem = ?1 AND (package = ?2 OR dependency = ?2)
-            )
-            THEN 1 ELSE 0
-         END",
-        params![ecosystem.as_str(), package],
-        |row| row.get(0),
-    )?;
-    let repository = load_package_repository_identity_blocking(conn, ecosystem, package)?;
-
-    if known == 0 {
+    if direct_popularity.is_none() && direct_dependencies_seen == 0 && reverse_dependents_seen == 0
+    {
         return Ok(None);
     }
+    let repository = load_package_repository_identity_blocking(conn, ecosystem, package)?;
 
     Ok(Some(GraphEvidence {
         ecosystem,
         package: package.to_string(),
         known: true,
-        direct_popularity,
+        direct_popularity: direct_popularity.unwrap_or_default(),
         direct_dependencies_seen: usize::try_from(direct_dependencies_seen)
             .context("graph dependency count exceeds usize range")?,
         reverse_dependents_seen: usize::try_from(reverse_dependents_seen)
@@ -1807,6 +2674,8 @@ fn load_graph_records_for_roots_blocking(
     roots: &[String],
     per_root_limit: usize,
 ) -> Result<GraphNeighborhoodRecords> {
+    const SQLITE_IN_BATCH: usize = 900;
+
     let normalized_roots = roots
         .iter()
         .map(|root| root.trim())
@@ -1820,32 +2689,35 @@ fn load_graph_records_for_roots_blocking(
         });
     }
 
-    let root_values = normalized_roots
-        .iter()
-        .map(|value| rusqlite::types::Value::from(value.clone()))
-        .collect::<Vec<_>>();
-    let incoming_limit =
-        i64::try_from(per_root_limit.saturating_mul(normalized_roots.len()).max(1))
+    let mut reverse_dependents = BTreeSet::new();
+    for root_chunk in normalized_roots.chunks(SQLITE_IN_BATCH) {
+        let root_values = root_chunk
+            .iter()
+            .map(|value| rusqlite::types::Value::from(value.clone()))
+            .collect::<Vec<_>>();
+        let incoming_limit = i64::try_from(per_root_limit.saturating_mul(root_chunk.len()).max(1))
             .context("graph records limit exceeds i64 range")?;
-    let incoming_sql = format!(
-        "SELECT DISTINCT package
-         FROM graph_edge_index
-         WHERE ecosystem = ?1 AND dependency IN ({})
-         ORDER BY package
-         LIMIT ?{}",
-        sqlite_placeholders(2, root_values.len()),
-        root_values.len() + 2
-    );
-    let mut incoming_params = Vec::with_capacity(2 + root_values.len());
-    incoming_params.push(rusqlite::types::Value::from(ecosystem.as_str().to_string()));
-    incoming_params.extend(root_values.iter().cloned());
-    incoming_params.push(rusqlite::types::Value::from(incoming_limit));
-    let mut incoming_statement = conn.prepare(&incoming_sql)?;
-    let reverse_dependents = incoming_statement
-        .query_map(rusqlite::params_from_iter(incoming_params), |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        let incoming_sql = format!(
+            "SELECT DISTINCT package
+             FROM graph_edge_index
+             WHERE ecosystem = ?1 AND dependency IN ({})
+             ORDER BY package
+             LIMIT ?{}",
+            sqlite_placeholders(2, root_values.len()),
+            root_values.len() + 2
+        );
+        let mut incoming_params = Vec::with_capacity(2 + root_values.len());
+        incoming_params.push(rusqlite::types::Value::from(ecosystem.as_str().to_string()));
+        incoming_params.extend(root_values.iter().cloned());
+        incoming_params.push(rusqlite::types::Value::from(incoming_limit));
+        let mut incoming_statement = conn.prepare(&incoming_sql)?;
+        let chunk_rows = incoming_statement
+            .query_map(rusqlite::params_from_iter(incoming_params), |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        reverse_dependents.extend(chunk_rows);
+    }
 
     let mut frontier = BTreeSet::new();
     for root in &normalized_roots {
@@ -1860,38 +2732,43 @@ fn load_graph_records_for_roots_blocking(
             records: Vec::new(),
         });
     }
-    let frontier_values = frontier
-        .iter()
-        .cloned()
-        .map(rusqlite::types::Value::from)
-        .collect::<Vec<_>>();
-    let edge_limit = i64::try_from(per_root_limit.saturating_mul(frontier_values.len()).max(1))
-        .context("graph edge limit exceeds i64 range")?;
-    let edge_sql = format!(
-        "SELECT package, dependency, weight, sources_json, confidence
-         FROM graph_edge_index
-         WHERE ecosystem = ?1 AND package IN ({})
-         ORDER BY package, dependency
-         LIMIT ?{}",
-        sqlite_placeholders(2, frontier_values.len()),
-        frontier_values.len() + 2
-    );
-    let mut edge_params = Vec::with_capacity(2 + frontier_values.len());
-    edge_params.push(rusqlite::types::Value::from(ecosystem.as_str().to_string()));
-    edge_params.extend(frontier_values.iter().cloned());
-    edge_params.push(rusqlite::types::Value::from(edge_limit));
-    let mut edge_statement = conn.prepare(&edge_sql)?;
-    let edges = edge_statement
-        .query_map(rusqlite::params_from_iter(edge_params), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, f64>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<f64>>(4)?,
-            ))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let frontier_list = frontier.iter().cloned().collect::<Vec<_>>();
+    let mut edges = Vec::new();
+    for frontier_chunk in frontier_list.chunks(SQLITE_IN_BATCH) {
+        let frontier_values = frontier_chunk
+            .iter()
+            .cloned()
+            .map(rusqlite::types::Value::from)
+            .collect::<Vec<_>>();
+        let edge_limit = i64::try_from(per_root_limit.saturating_mul(frontier_chunk.len()).max(1))
+            .context("graph edge limit exceeds i64 range")?;
+        let edge_sql = format!(
+            "SELECT package, dependency, weight, sources_json, confidence
+             FROM graph_edge_index
+             WHERE ecosystem = ?1 AND package IN ({})
+             ORDER BY package, dependency
+             LIMIT ?{}",
+            sqlite_placeholders(2, frontier_values.len()),
+            frontier_values.len() + 2
+        );
+        let mut edge_params = Vec::with_capacity(2 + frontier_values.len());
+        edge_params.push(rusqlite::types::Value::from(ecosystem.as_str().to_string()));
+        edge_params.extend(frontier_values.iter().cloned());
+        edge_params.push(rusqlite::types::Value::from(edge_limit));
+        let mut edge_statement = conn.prepare(&edge_sql)?;
+        let chunk_edges = edge_statement
+            .query_map(rusqlite::params_from_iter(edge_params), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<f64>>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        edges.extend(chunk_edges);
+    }
 
     let mut package_names = frontier.clone();
     for (package, dependency, _, _, _) in &edges {
@@ -1899,26 +2776,31 @@ fn load_graph_records_for_roots_blocking(
         package_names.insert(dependency.clone());
     }
 
-    let package_values = package_names
-        .iter()
-        .cloned()
-        .map(rusqlite::types::Value::from)
-        .collect::<Vec<_>>();
-    let package_sql = format!(
-        "SELECT package, direct_popularity
-         FROM graph_package_index
-         WHERE ecosystem = ?1 AND package IN ({})",
-        sqlite_placeholders(2, package_values.len())
-    );
-    let mut package_params = Vec::with_capacity(1 + package_values.len());
-    package_params.push(rusqlite::types::Value::from(ecosystem.as_str().to_string()));
-    package_params.extend(package_values.iter().cloned());
-    let mut package_statement = conn.prepare(&package_sql)?;
-    let known_packages = package_statement
-        .query_map(rusqlite::params_from_iter(package_params), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-        })?
-        .collect::<std::result::Result<HashMap<_, _>, _>>()?;
+    let package_list = package_names.iter().cloned().collect::<Vec<_>>();
+    let mut known_packages = HashMap::new();
+    for package_chunk in package_list.chunks(SQLITE_IN_BATCH) {
+        let package_values = package_chunk
+            .iter()
+            .cloned()
+            .map(rusqlite::types::Value::from)
+            .collect::<Vec<_>>();
+        let package_sql = format!(
+            "SELECT package, direct_popularity
+             FROM graph_package_index
+             WHERE ecosystem = ?1 AND package IN ({})",
+            sqlite_placeholders(2, package_values.len())
+        );
+        let mut package_params = Vec::with_capacity(1 + package_values.len());
+        package_params.push(rusqlite::types::Value::from(ecosystem.as_str().to_string()));
+        package_params.extend(package_values.iter().cloned());
+        let mut package_statement = conn.prepare(&package_sql)?;
+        let chunk_packages = package_statement
+            .query_map(rusqlite::params_from_iter(package_params), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })?
+            .collect::<std::result::Result<HashMap<_, _>, _>>()?;
+        known_packages.extend(chunk_packages);
+    }
 
     let mut records = Vec::new();
     for package in &package_names {
@@ -2402,6 +3284,65 @@ mod tests {
         assert_eq!(stats.diff_states.ready, 1);
         assert_eq!(stats.diff_states.skipped, 2);
         assert_eq!(stats.diff_states.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn store_batches_concurrent_event_writes_on_the_shared_writer() {
+        let temp = tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let store = OperationalStore::open(index_db_path(&data_dir))
+            .await
+            .unwrap();
+
+        let mut tasks = Vec::new();
+        for index in 0..64 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                let event = sample_event(&format!("1.0.{index}"));
+                store
+                    .record_event(&event, EventOrigin::Observed)
+                    .await
+                    .unwrap();
+            }));
+        }
+
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert_eq!(store.event_count().await.unwrap(), 64);
+    }
+
+    #[tokio::test]
+    async fn store_reuses_pooled_connections_for_repeated_reads() {
+        let temp = tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let store_path = index_db_path(&data_dir);
+        let store = OperationalStore::open(store_path.clone()).await.unwrap();
+
+        let event = sample_event("1.0.0");
+        store
+            .record_event(&event, EventOrigin::Observed)
+            .await
+            .unwrap();
+
+        let baseline_open_count = opened_connection_count_for_test(&store_path);
+
+        for _ in 0..32 {
+            let loaded = store.load_event(&event.event_id).await.unwrap().unwrap();
+            assert_eq!(loaded.event_id, event.event_id);
+            assert_eq!(store.event_count().await.unwrap(), 1);
+            let recent = store
+                .load_recent_events(Some(Ecosystem::Pypi), 10)
+                .await
+                .unwrap();
+            assert_eq!(recent.len(), 1);
+        }
+
+        assert_eq!(
+            opened_connection_count_for_test(&store_path),
+            baseline_open_count
+        );
     }
 
     #[tokio::test]

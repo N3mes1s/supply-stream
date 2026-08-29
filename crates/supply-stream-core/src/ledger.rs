@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -18,8 +19,19 @@ pub const RECONSTRUCTED_EVENTS_LOG: &str = "reconstructed-events.ndjson";
 
 pub struct EventLedger {
     path: PathBuf,
-    writer: Mutex<BufWriter<File>>,
+    writer: Mutex<LedgerWriterState>,
 }
+
+struct LedgerWriterState {
+    writer: BufWriter<File>,
+    pending_sync_events: usize,
+    pending_sync_bytes: usize,
+    last_sync_at: Instant,
+}
+
+const LEDGER_SYNC_MAX_DELAY: Duration = Duration::from_millis(250);
+const LEDGER_SYNC_MAX_PENDING_EVENTS: usize = 64;
+const LEDGER_SYNC_MAX_PENDING_BYTES: usize = 256 * 1024;
 
 impl EventLedger {
     pub async fn open(path: PathBuf) -> Result<Self> {
@@ -38,22 +50,45 @@ impl EventLedger {
 
         Ok(Self {
             path,
-            writer: Mutex::new(BufWriter::new(file)),
+            writer: Mutex::new(LedgerWriterState {
+                writer: BufWriter::new(file),
+                pending_sync_events: 0,
+                pending_sync_bytes: 0,
+                last_sync_at: Instant::now(),
+            }),
         })
     }
 
     pub async fn append(&self, event: &PackageReleaseEvent) -> Result<()> {
-        let mut writer = self.writer.lock().await;
+        let mut state = self.writer.lock().await;
         let mut encoded = serde_json::to_vec(event).context("failed to encode event for ledger")?;
         encoded.push(b'\n');
-        writer
+        state
+            .writer
             .write_all(&encoded)
             .await
             .with_context(|| format!("failed to append event to {}", self.path.display()))?;
-        writer
+        state
+            .writer
             .flush()
             .await
             .with_context(|| format!("failed to flush event ledger {}", self.path.display()))?;
+        state.pending_sync_events += 1;
+        state.pending_sync_bytes += encoded.len();
+        if state.pending_sync_events >= LEDGER_SYNC_MAX_PENDING_EVENTS
+            || state.pending_sync_bytes >= LEDGER_SYNC_MAX_PENDING_BYTES
+            || state.last_sync_at.elapsed() >= LEDGER_SYNC_MAX_DELAY
+        {
+            state
+                .writer
+                .get_ref()
+                .sync_all()
+                .await
+                .with_context(|| format!("failed to sync event ledger {}", self.path.display()))?;
+            state.pending_sync_events = 0;
+            state.pending_sync_bytes = 0;
+            state.last_sync_at = Instant::now();
+        }
         Ok(())
     }
 }

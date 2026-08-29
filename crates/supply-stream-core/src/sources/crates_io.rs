@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -16,7 +17,7 @@ use tracing::{debug, info, warn};
 use crate::{
     config::CratesConfig,
     event::{Ecosystem, PackageReleaseEvent},
-    sources::{PackageSource, sleep_or_shutdown},
+    sources::{FailureBackoff, PackageSource, RequestThrottle, sleep_or_shutdown},
     state::{FileStateStore, RecentKeys, RecentKeysState},
 };
 
@@ -25,6 +26,8 @@ const CRATES_INDEX_GIT_URL: &str = "https://github.com/rust-lang/crates.io-index
 const CRATES_INDEX_DIR: &str = "crates-io-index.git";
 const CRATES_INDEX_FETCH_DEPTH: i32 = 256;
 const STATE_KEY: &str = "crates-io";
+const SHALLOW_LOCK_ACTIVE_GRACE: Duration = Duration::from_secs(30);
+const INDEX_SYNC_FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct CratesState {
@@ -77,6 +80,7 @@ pub struct CratesIoSource {
     state_store: FileStateStore,
     shutdown: CancellationToken,
     config: CratesConfig,
+    throttle: RequestThrottle,
     once: bool,
 }
 
@@ -94,6 +98,7 @@ impl CratesIoSource {
             tx,
             state_store,
             shutdown,
+            throttle: RequestThrottle::new("crates-io", &config.resilience),
             config,
             once,
         }
@@ -101,9 +106,8 @@ impl CratesIoSource {
 
     async fn fetch_summary_events(&self) -> Result<Vec<PackageReleaseEvent>> {
         let summary = self
-            .http
-            .get(CRATES_SUMMARY_URL)
-            .send()
+            .throttle
+            .send(&self.shutdown, || self.http.get(CRATES_SUMMARY_URL).send())
             .await
             .context("failed to fetch crates.io summary")?
             .error_for_status()
@@ -145,6 +149,8 @@ impl PackageSource for CratesIoSource {
             state.recent_release_keys.clone(),
             self.config.recent_key_capacity,
         );
+        let mut backoff = FailureBackoff::new(&self.config.resilience);
+        let mut index_sync_cooldown_until: Option<Instant> = None;
 
         loop {
             if self.shutdown.is_cancelled() {
@@ -154,6 +160,7 @@ impl PackageSource for CratesIoSource {
             if !state.warmed_up {
                 match self.fetch_remote_index_head().await {
                     Ok(head) => {
+                        backoff.reset();
                         state.warmed_up = true;
                         state.last_index_head = Some(head);
                         state.recent_release_keys = recent_keys.snapshot();
@@ -179,14 +186,14 @@ impl PackageSource for CratesIoSource {
                     Ok(events) => events,
                     Err(error) => {
                         warn!(error = %error, "crates.io summary bootstrap failed");
-                        if self.once
-                            || sleep_or_shutdown(&self.shutdown, self.config.poll_interval).await
-                        {
+                        let delay = backoff.next_delay();
+                        if self.once || sleep_or_shutdown(&self.shutdown, delay).await {
                             return Ok(());
                         }
                         continue;
                     }
                 };
+                backoff.reset();
 
                 for event in &events {
                     recent_keys.insert(event.release_key());
@@ -207,9 +214,13 @@ impl PackageSource for CratesIoSource {
                 continue;
             }
 
-            if let Some(last_head) = state.last_index_head.clone() {
+            if let Some(last_head) = state.last_index_head.clone()
+                && index_sync_ready(index_sync_cooldown_until)
+            {
                 match self.sync_index(Some(last_head)).await {
                     Ok(sync) => {
+                        index_sync_cooldown_until = None;
+                        backoff.reset();
                         let mut emitted = 0usize;
                         for event in sync.events {
                             let release_key = event.release_key();
@@ -235,6 +246,8 @@ impl PackageSource for CratesIoSource {
                         continue;
                     }
                     Err(error) => {
+                        index_sync_cooldown_until =
+                            Some(Instant::now() + INDEX_SYNC_FAILURE_COOLDOWN);
                         warn!(error = %error, "crates.io index poll failed; falling back to summary");
                     }
                 }
@@ -244,14 +257,14 @@ impl PackageSource for CratesIoSource {
                 Ok(events) => events,
                 Err(error) => {
                     warn!(error = %error, "crates.io poll failed");
-                    if self.once
-                        || sleep_or_shutdown(&self.shutdown, self.config.poll_interval).await
-                    {
+                    let delay = backoff.next_delay();
+                    if self.once || sleep_or_shutdown(&self.shutdown, delay).await {
                         return Ok(());
                     }
                     continue;
                 }
             };
+            backoff.reset();
 
             let mut emitted = 0usize;
             for event in events {
@@ -302,6 +315,12 @@ fn sync_index_blocking(repo_path: &Path, since_head: Option<&str>) -> Result<Cra
     };
 
     Ok(CratesIndexSync { head, events })
+}
+
+fn index_sync_ready(cooldown_until: Option<Instant>) -> bool {
+    cooldown_until
+        .map(|until| Instant::now() >= until)
+        .unwrap_or(true)
 }
 
 fn fetch_remote_index_head_blocking() -> Result<CratesIndexRemoteHead> {
@@ -412,6 +431,9 @@ fn ensure_index_remote(path: &Path) -> Result<()> {
 
 fn fetch_index_updates(repo_path: &Path, branch_ref: Option<&str>) -> Result<()> {
     ensure_index_remote(repo_path)?;
+    if active_shallow_lock_present(repo_path)? {
+        anyhow::bail!("crates.io index fetch skipped because an active shallow.lock is present");
+    }
     clear_stale_shallow_lock(repo_path)?;
 
     let branch_ref = branch_ref.unwrap_or("refs/heads/master");
@@ -466,6 +488,20 @@ fn fetch_index_updates(repo_path: &Path, branch_ref: Option<&str>) -> Result<()>
         "git fetch crates.io index failed: {}",
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+fn active_shallow_lock_present(repo_path: &Path) -> Result<bool> {
+    let lock_path = repo_path.join("shallow.lock");
+    if !lock_path.exists() {
+        return Ok(false);
+    }
+    let modified = std::fs::metadata(&lock_path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let lock_is_recent = modified
+        .and_then(|timestamp| timestamp.elapsed().ok())
+        .is_some_and(|age| age <= SHALLOW_LOCK_ACTIVE_GRACE);
+    Ok(lock_is_recent && git_process_uses_repo(repo_path)?)
 }
 
 fn run_index_fetch(repo_path: &Path, depth: &str, refspec: &str) -> Command {
@@ -756,5 +792,16 @@ mod tests {
         assert_eq!(events[0].package, "demo");
         assert_eq!(events[0].version, "0.2.0");
         assert_eq!(events[0].source, "crates.index.git");
+    }
+
+    #[test]
+    fn index_sync_ready_respects_active_cooldown() {
+        assert!(index_sync_ready(None));
+        assert!(!index_sync_ready(Some(
+            Instant::now() + Duration::from_secs(1)
+        )));
+        assert!(index_sync_ready(Some(
+            Instant::now() - Duration::from_secs(1)
+        )));
     }
 }

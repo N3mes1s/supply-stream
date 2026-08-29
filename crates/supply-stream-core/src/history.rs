@@ -14,6 +14,7 @@ use crate::{
     capture::{CapturedRelease, ReleaseStatus},
     event::{Ecosystem, PackageReleaseEvent},
     ledger::{self, EventLedger},
+    sources::{RequestThrottle, default_offline_resilience_config},
     store::{self, EventOrigin, OperationalStore},
     visibility::{ProbeResult, ProbeState, VisibilityReport},
 };
@@ -208,10 +209,20 @@ pub async fn load_package_history_online(
     package: &str,
 ) -> Result<Vec<HistoryEntry>> {
     let http = history_http_client()?;
+    let resilience = default_offline_resilience_config();
     let mut entries = match ecosystem {
-        Ecosystem::Pypi => load_pypi_history_online(&http, package).await?,
-        Ecosystem::Npm => load_npm_history_online(&http, package).await?,
-        Ecosystem::CratesIo => load_crates_history_online(&http, package).await?,
+        Ecosystem::Pypi => {
+            let throttle = RequestThrottle::new("history-pypi", &resilience);
+            load_pypi_history_online(&http, &throttle, package).await?
+        }
+        Ecosystem::Npm => {
+            let throttle = RequestThrottle::new("history-npm", &resilience);
+            load_npm_history_online(&http, &throttle, package).await?
+        }
+        Ecosystem::CratesIo => {
+            let throttle = RequestThrottle::new("history-crates-io", &resilience);
+            load_crates_history_online(&http, &throttle, package).await?
+        }
     };
     entries.sort_by_key(history_sort_key);
     Ok(entries)
@@ -537,13 +548,13 @@ fn parse_event_id(event_id: &str) -> Result<ParsedEventId> {
 
 async fn load_pypi_history_online(
     http: &reqwest::Client,
+    throttle: &RequestThrottle,
     package: &str,
 ) -> Result<Vec<HistoryEntry>> {
     let encoded = urlencoding::encode(package);
     let metadata_url = format!("https://pypi.org/pypi/{encoded}/json");
-    let raw = http
-        .get(&metadata_url)
-        .send()
+    let raw = throttle
+        .send_without_shutdown(|| http.get(&metadata_url).send())
         .await
         .with_context(|| format!("failed to fetch PyPI project metadata for {package}"))?
         .error_for_status()
@@ -676,13 +687,13 @@ async fn load_pypi_history_online(
 
 async fn load_npm_history_online(
     http: &reqwest::Client,
+    throttle: &RequestThrottle,
     package: &str,
 ) -> Result<Vec<HistoryEntry>> {
     let encoded = urlencoding::encode(package);
     let metadata_url = format!("https://registry.npmjs.org/{encoded}");
-    let raw = http
-        .get(&metadata_url)
-        .send()
+    let raw = throttle
+        .send_without_shutdown(|| http.get(&metadata_url).send())
         .await
         .with_context(|| format!("failed to fetch npm packument for {package}"))?
         .error_for_status()
@@ -784,13 +795,13 @@ async fn load_npm_history_online(
 
 async fn load_crates_history_online(
     http: &reqwest::Client,
+    throttle: &RequestThrottle,
     package: &str,
 ) -> Result<Vec<HistoryEntry>> {
     let encoded = urlencoding::encode(package);
     let metadata_url = format!("https://crates.io/api/v1/crates/{encoded}");
-    let raw = http
-        .get(&metadata_url)
-        .send()
+    let raw = throttle
+        .send_without_shutdown(|| http.get(&metadata_url).send())
         .await
         .with_context(|| format!("failed to fetch crates.io metadata for {package}"))?
         .error_for_status()

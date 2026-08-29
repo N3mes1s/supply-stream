@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::StreamExt;
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -12,13 +13,15 @@ use tracing::{debug, info, warn};
 use crate::{
     config::NpmConfig,
     event::{Ecosystem, PackageReleaseEvent},
-    sources::{PackageSource, sleep_or_shutdown},
+    sources::{FailureBackoff, PackageSource, RequestThrottle, sleep_or_shutdown},
     state::{FileStateStore, RecentKeys, RecentKeysState},
 };
 
 const NPM_CHANGES_URL: &str = "https://replicate.npmjs.com/registry/_changes";
 const NPM_ROOT_URL: &str = "https://replicate.npmjs.com/";
 const NPM_PACKUMENT_BASE_URL: &str = "https://registry.npmjs.org/";
+const NPM_ABBREVIATED_PACKUMENT_ACCEPT: &str =
+    "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
 const STATE_KEY: &str = "npm";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -52,7 +55,7 @@ struct NpmChange {
 #[derive(Debug, Deserialize)]
 struct NpmPackument {
     #[serde(default)]
-    versions: HashMap<String, serde_json::Value>,
+    versions: HashMap<String, IgnoredAny>,
     #[serde(default)]
     time: HashMap<String, String>,
 }
@@ -63,6 +66,7 @@ pub struct NpmSource {
     state_store: FileStateStore,
     shutdown: CancellationToken,
     config: NpmConfig,
+    throttle: RequestThrottle,
     once: bool,
 }
 
@@ -80,6 +84,7 @@ impl NpmSource {
             tx,
             state_store,
             shutdown,
+            throttle: RequestThrottle::new("npm", &config.resilience),
             config,
             once,
         }
@@ -87,9 +92,8 @@ impl NpmSource {
 
     async fn bootstrap_state(&self, state: &mut NpmState) -> Result<()> {
         let response = self
-            .http
-            .get(NPM_ROOT_URL)
-            .send()
+            .throttle
+            .send(&self.shutdown, || self.http.get(NPM_ROOT_URL).send())
             .await
             .context("failed to fetch npm replication root")?
             .error_for_status()
@@ -108,13 +112,16 @@ impl NpmSource {
     }
 
     async fn fetch_changes(&self, since: &str) -> Result<NpmChangesResponse> {
-        self.http
-            .get(NPM_CHANGES_URL)
-            .query(&[
-                ("since", since.to_string()),
-                ("limit", self.config.batch_size.to_string()),
-            ])
-            .send()
+        self.throttle
+            .send(&self.shutdown, || {
+                self.http
+                    .get(NPM_CHANGES_URL)
+                    .query(&[
+                        ("since", since.to_string()),
+                        ("limit", self.config.batch_size.to_string()),
+                    ])
+                    .send()
+            })
             .await
             .context("failed to fetch npm changes page")?
             .error_for_status()
@@ -141,6 +148,7 @@ impl PackageSource for NpmSource {
             state.recent_release_keys.clone(),
             self.config.recent_key_capacity,
         );
+        let mut backoff = FailureBackoff::new(&self.config.resilience);
 
         if state.since.is_none() {
             self.bootstrap_state(&mut state).await?;
@@ -162,13 +170,14 @@ impl PackageSource for NpmSource {
                 Ok(page) => page,
                 Err(error) => {
                     warn!(error = %error, "npm poll failed");
-                    if self.once || sleep_or_shutdown(&self.shutdown, self.config.idle_delay).await
-                    {
+                    let delay = backoff.next_delay();
+                    if self.once || sleep_or_shutdown(&self.shutdown, delay).await {
                         return Ok(());
                     }
                     continue;
                 }
             };
+            backoff.reset();
 
             if page.results.is_empty() {
                 debug!("npm changes page empty");
@@ -186,6 +195,8 @@ impl PackageSource for NpmSource {
                 .context("npm changes page missing pagination cursor")?;
 
             let http = self.http.clone();
+            let throttle = self.throttle.clone();
+            let shutdown = self.shutdown.clone();
             let publish_window = self.config.recent_publish_window;
             let releases = futures::stream::iter(
                 page.results
@@ -195,9 +206,12 @@ impl PackageSource for NpmSource {
             )
             .map(move |change| {
                 let http = http.clone();
+                let throttle = throttle.clone();
+                let shutdown = shutdown.clone();
                 async move {
                     let seq = seq_to_string(&change.seq);
-                    let packument = fetch_packument(&http, &change.id).await?;
+                    let packument =
+                        fetch_packument(&throttle, &shutdown, &http, &change.id).await?;
                     Ok::<_, anyhow::Error>(extract_recent_releases(
                         &change.id,
                         &seq,
@@ -304,17 +318,44 @@ fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
         .map(|timestamp| timestamp.with_timezone(&Utc))
 }
 
-async fn fetch_packument(http: &reqwest::Client, package: &str) -> Result<NpmPackument> {
+async fn fetch_packument(
+    throttle: &RequestThrottle,
+    shutdown: &CancellationToken,
+    http: &reqwest::Client,
+    package: &str,
+) -> Result<NpmPackument> {
     let encoded = urlencoding::encode(package);
-    http.get(format!("{NPM_PACKUMENT_BASE_URL}{encoded}"))
-        .send()
+    let response = throttle
+        .send(shutdown, || {
+            http.get(format!("{NPM_PACKUMENT_BASE_URL}{encoded}"))
+                .header(reqwest::header::ACCEPT, NPM_ABBREVIATED_PACKUMENT_ACCEPT)
+                .send()
+        })
         .await
         .with_context(|| format!("failed to fetch npm packument for {package}"))?
         .error_for_status()
-        .with_context(|| format!("npm packument returned an error for {package}"))?
+        .with_context(|| format!("npm packument returned an error for {package}"))?;
+    let packument: NpmPackument = response
         .json()
         .await
-        .with_context(|| format!("failed to decode npm packument for {package}"))
+        .with_context(|| format!("failed to decode npm packument for {package}"))?;
+    if packument.time.contains_key("modified") {
+        return Ok(packument);
+    }
+
+    let response = throttle
+        .send(shutdown, || {
+            http.get(format!("{NPM_PACKUMENT_BASE_URL}{encoded}"))
+                .send()
+        })
+        .await
+        .with_context(|| format!("failed to refetch full npm packument for {package}"))?
+        .error_for_status()
+        .with_context(|| format!("full npm packument returned an error for {package}"))?;
+    response
+        .json()
+        .await
+        .with_context(|| format!("failed to decode full npm packument for {package}"))
 }
 
 fn seq_to_string(value: &serde_json::Value) -> String {
@@ -332,8 +373,8 @@ mod tests {
     fn extract_recent_releases_filters_old_versions() {
         let packument = NpmPackument {
             versions: HashMap::from([
-                ("1.0.0".to_string(), serde_json::json!({})),
-                ("2.0.0".to_string(), serde_json::json!({})),
+                ("1.0.0".to_string(), IgnoredAny),
+                ("2.0.0".to_string(), IgnoredAny),
             ]),
             time: HashMap::from([
                 (

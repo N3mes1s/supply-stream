@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use crate::{
     config::PypiConfig,
     event::{Ecosystem, PackageReleaseEvent},
-    sources::{PackageSource, sleep_or_shutdown},
+    sources::{FailureBackoff, PackageSource, RequestThrottle, sleep_or_shutdown},
     state::{FileStateStore, RecentKeys, RecentKeysState},
 };
 
@@ -51,6 +51,7 @@ pub struct PypiSource {
     state_store: FileStateStore,
     shutdown: CancellationToken,
     config: PypiConfig,
+    throttle: RequestThrottle,
     once: bool,
 }
 
@@ -68,6 +69,7 @@ impl PypiSource {
             tx,
             state_store,
             shutdown,
+            throttle: RequestThrottle::new("pypi", &config.resilience),
             config,
             once,
         }
@@ -75,9 +77,8 @@ impl PypiSource {
 
     async fn fetch_events(&self) -> Result<Vec<PackageReleaseEvent>> {
         let body = self
-            .http
-            .get(PYPI_UPDATES_URL)
-            .send()
+            .throttle
+            .send(&self.shutdown, || self.http.get(PYPI_UPDATES_URL).send())
             .await
             .context("failed to fetch PyPI updates feed")?
             .error_for_status()
@@ -99,11 +100,14 @@ impl PypiSource {
 
     async fn fetch_last_serial(&self) -> Result<u64> {
         let body = self
-            .http
-            .post(PYPI_XMLRPC_URL)
-            .header(reqwest::header::CONTENT_TYPE, "text/xml")
-            .body(xmlrpc_request("changelog_last_serial", &[]))
-            .send()
+            .throttle
+            .send(&self.shutdown, || {
+                self.http
+                    .post(PYPI_XMLRPC_URL)
+                    .header(reqwest::header::CONTENT_TYPE, "text/xml")
+                    .body(xmlrpc_request("changelog_last_serial", &[]))
+                    .send()
+            })
             .await
             .context("failed to fetch PyPI changelog last serial")?
             .error_for_status()
@@ -119,16 +123,19 @@ impl PypiSource {
 
     async fn fetch_journal_events_since(&self, since_serial: u64) -> Result<Vec<PypiJournalEntry>> {
         let body = self
-            .http
-            .post(PYPI_XMLRPC_URL)
-            .header(reqwest::header::CONTENT_TYPE, "text/xml")
-            .body(xmlrpc_request(
-                "changelog_since_serial",
-                &[XmlRpcValue::Int(
-                    i64::try_from(since_serial).context("since_serial exceeds i64 range")?,
-                )],
-            ))
-            .send()
+            .throttle
+            .send(&self.shutdown, || {
+                self.http
+                    .post(PYPI_XMLRPC_URL)
+                    .header(reqwest::header::CONTENT_TYPE, "text/xml")
+                    .body(xmlrpc_request(
+                        "changelog_since_serial",
+                        &[XmlRpcValue::Int(
+                            i64::try_from(since_serial).expect("since_serial checked above"),
+                        )],
+                    ))
+                    .send()
+            })
             .await
             .context("failed to fetch PyPI changelog entries")?
             .error_for_status()
@@ -157,6 +164,7 @@ impl PackageSource for PypiSource {
             state.recent_release_keys.clone(),
             self.config.recent_key_capacity,
         );
+        let mut backoff = FailureBackoff::new(&self.config.resilience);
 
         loop {
             if self.shutdown.is_cancelled() {
@@ -166,6 +174,7 @@ impl PackageSource for PypiSource {
             if !state.warmed_up {
                 match self.fetch_last_serial().await {
                     Ok(last_serial) => {
+                        backoff.reset();
                         if let Ok(feed_events) = self.fetch_events().await {
                             for event in &feed_events {
                                 recent_keys.insert(event.release_key());
@@ -196,14 +205,14 @@ impl PackageSource for PypiSource {
                     Ok(events) => events,
                     Err(error) => {
                         warn!(error = %error, "PyPI RSS bootstrap failed");
-                        if self.once
-                            || sleep_or_shutdown(&self.shutdown, self.config.poll_interval).await
-                        {
+                        let delay = backoff.next_delay();
+                        if self.once || sleep_or_shutdown(&self.shutdown, delay).await {
                             return Ok(());
                         }
                         continue;
                     }
                 };
+                backoff.reset();
 
                 for event in &events {
                     recent_keys.insert(event.release_key());
@@ -227,6 +236,7 @@ impl PackageSource for PypiSource {
             if let Some(last_serial) = state.last_serial {
                 match self.fetch_journal_events_since(last_serial).await {
                     Ok(entries) => {
+                        backoff.reset();
                         let mut emitted = 0usize;
                         let mut max_serial = last_serial;
                         for entry in entries {
@@ -269,14 +279,14 @@ impl PackageSource for PypiSource {
                 Ok(events) => events,
                 Err(error) => {
                     warn!(error = %error, "PyPI RSS poll failed");
-                    if self.once
-                        || sleep_or_shutdown(&self.shutdown, self.config.poll_interval).await
-                    {
+                    let delay = backoff.next_delay();
+                    if self.once || sleep_or_shutdown(&self.shutdown, delay).await {
                         return Ok(());
                     }
                     continue;
                 }
             };
+            backoff.reset();
 
             let mut emitted = 0usize;
             for event in events {

@@ -9,7 +9,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::repo_provenance::{self, PackageRepositoryIdentity};
-use crate::{event::Ecosystem, priority::normalize_package_name, scoring::ScoreInputRecord};
+use crate::{
+    event::Ecosystem,
+    priority::normalize_package_name,
+    scoring::ScoreInputRecord,
+    sources::{RequestThrottle, default_offline_resilience_config},
+};
 
 #[derive(Debug, Clone)]
 pub struct CollectConfig {
@@ -64,6 +69,10 @@ pub struct CollectedGraphMaterial {
 struct CollectContext {
     http: reqwest::Client,
     endpoints: CollectorEndpoints,
+    npm_throttle: RequestThrottle,
+    pypi_throttle: RequestThrottle,
+    crates_throttle: RequestThrottle,
+    deps_dev_throttle: RequestThrottle,
 }
 
 #[derive(Debug, Clone)]
@@ -225,10 +234,15 @@ pub async fn collect_graph_material_from_records(
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .context("failed to build collector HTTP client")?;
+    let resilience = default_offline_resilience_config();
     collect_graph_material_with_context(
         CollectContext {
             http,
             endpoints: CollectorEndpoints::default(),
+            npm_throttle: RequestThrottle::new("collector-npm", &resilience),
+            pypi_throttle: RequestThrottle::new("collector-pypi", &resilience),
+            crates_throttle: RequestThrottle::new("collector-crates-io", &resilience),
+            deps_dev_throttle: RequestThrottle::new("collector-deps-dev", &resilience),
         },
         seeds,
         popularity,
@@ -452,9 +466,14 @@ pub async fn fetch_package_repository_identity(
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .context("failed to build collector HTTP client")?;
+    let resilience = default_offline_resilience_config();
     let context = CollectContext {
         http,
         endpoints: CollectorEndpoints::default(),
+        npm_throttle: RequestThrottle::new("collector-npm", &resilience),
+        pypi_throttle: RequestThrottle::new("collector-pypi", &resilience),
+        crates_throttle: RequestThrottle::new("collector-crates-io", &resilience),
+        deps_dev_throttle: RequestThrottle::new("collector-deps-dev", &resilience),
     };
     Ok(fetch_node(&context, ecosystem, package, false)
         .await?
@@ -498,9 +517,8 @@ async fn fetch_deps_dev_node(
         context.endpoints.deps_dev_base, system, encoded
     );
     let package_raw = context
-        .http
-        .get(&package_url)
-        .send()
+        .deps_dev_throttle
+        .send_without_shutdown(|| context.http.get(&package_url).send())
         .await
         .with_context(|| format!("failed to fetch deps.dev package for {ecosystem}:{package}"))?
         .error_for_status()
@@ -519,9 +537,8 @@ async fn fetch_deps_dev_node(
         urlencoding::encode(&version)
     );
     let dependencies_raw = context
-        .http
-        .get(&dependencies_url)
-        .send()
+        .deps_dev_throttle
+        .send_without_shutdown(|| context.http.get(&dependencies_url).send())
         .await
         .with_context(|| {
             format!("failed to fetch deps.dev dependencies for {ecosystem}:{package}@{version}")
@@ -561,9 +578,8 @@ async fn fetch_npm_latest_node(
 ) -> Result<CollectedNode> {
     let url = format!("{}/{}/latest", context.endpoints.npm_registry_base, encoded);
     let raw = context
-        .http
-        .get(&url)
-        .send()
+        .npm_throttle
+        .send_without_shutdown(|| context.http.get(&url).send())
         .await
         .with_context(|| format!("failed to fetch npm latest manifest for {package}"))?
         .error_for_status()
@@ -600,9 +616,8 @@ async fn fetch_npm_packument_node(
 ) -> Result<CollectedNode> {
     let url = format!("{}/{}", context.endpoints.npm_registry_base, encoded);
     let raw = context
-        .http
-        .get(&url)
-        .send()
+        .npm_throttle
+        .send_without_shutdown(|| context.http.get(&url).send())
         .await
         .with_context(|| format!("failed to fetch npm packument for {package}"))?
         .error_for_status()
@@ -641,9 +656,8 @@ async fn fetch_pypi_node(context: &CollectContext, package: &str) -> Result<Coll
     let encoded = urlencoding::encode(package);
     let url = format!("{}/{}/json", context.endpoints.pypi_project_base, encoded);
     let raw = context
-        .http
-        .get(&url)
-        .send()
+        .pypi_throttle
+        .send_without_shutdown(|| context.http.get(&url).send())
         .await
         .with_context(|| format!("failed to fetch PyPI metadata for {package}"))?
         .error_for_status()
@@ -689,9 +703,8 @@ async fn fetch_crates_index_node(context: &CollectContext, package: &str) -> Res
     let index_path = crates_index_path(package);
     let url = format!("{}/{}", context.endpoints.crates_index_base, index_path);
     let body = context
-        .http
-        .get(&url)
-        .send()
+        .crates_throttle
+        .send_without_shutdown(|| context.http.get(&url).send())
         .await
         .with_context(|| format!("failed to fetch crates.io sparse index for {package}"))?
         .error_for_status()
@@ -727,9 +740,8 @@ async fn fetch_crates_api_node(context: &CollectContext, package: &str) -> Resul
     let encoded = urlencoding::encode(package);
     let metadata_url = format!("{}/crates/{}", context.endpoints.crates_base, encoded);
     let raw = context
-        .http
-        .get(&metadata_url)
-        .send()
+        .crates_throttle
+        .send_without_shutdown(|| context.http.get(&metadata_url).send())
         .await
         .with_context(|| format!("failed to fetch crates.io metadata for {package}"))?
         .error_for_status()
@@ -749,9 +761,8 @@ async fn fetch_crates_api_node(context: &CollectContext, package: &str) -> Resul
         context.endpoints.crates_base, encoded, latest_version
     );
     let dependencies_raw = context
-        .http
-        .get(&dependency_url)
-        .send()
+        .crates_throttle
+        .send_without_shutdown(|| context.http.get(&dependency_url).send())
         .await
         .with_context(|| format!("failed to fetch crates.io dependencies for {package}"))?
         .error_for_status()

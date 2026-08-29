@@ -21,3 +21,7 @@ vendor/yara-x/target/
 # the durable equivalent)
 scripts/watch-stream-summary.sh
 scripts/watch-worthy-diffs.sh
+
+# Python bytecode from the fixture/scan scripts
+__pycache__/
+*.pyc

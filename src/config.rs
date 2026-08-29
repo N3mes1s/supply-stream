@@ -1,10 +1,10 @@
-use std::{path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::{ArgAction, Args, Parser, Subcommand};
 use supply_stream_core::{
     config::{
         AppConfig, AutoDiffConfig, CaptureConfig, CratesConfig, NpmConfig, PriorityConfig,
-        PriorityViewConfig, PypiConfig,
+        PriorityViewConfig, PypiConfig, TriageConfig,
     },
     diff::DEFAULT_PATCH_CONTEXT,
     event::Ecosystem,
@@ -12,8 +12,8 @@ use supply_stream_core::{
 };
 
 const DEFAULT_DIFF_QUEUE_CAPACITY: usize = 512;
-const DEFAULT_RUNTIME_STATS_INTERVAL_SECS: u64 = 15;
-const DEFAULT_PRIORITY_VIEW_INTERVAL_SECS: u64 = 30;
+const DEFAULT_RUNTIME_STATS_INTERVAL_SECS: u64 = 60;
+const DEFAULT_PRIORITY_VIEW_INTERVAL_SECS: u64 = 0;
 const DEFAULT_PRIORITY_REQUEST_CONCURRENCY: usize = 16;
 
 #[derive(Debug, Clone, Parser)]
@@ -51,6 +51,8 @@ pub struct RunArgs {
     #[arg(long, default_value = ".supply-stream-data")]
     pub data_dir: PathBuf,
     #[arg(long)]
+    pub health_bind: Option<SocketAddr>,
+    #[arg(long)]
     pub priority_file: Option<PathBuf>,
     #[arg(long)]
     pub priority_graph_file: Option<PathBuf>,
@@ -84,13 +86,37 @@ pub struct RunArgs {
     pub priority_view_limit: usize,
     #[arg(long, default_value_t = 1000)]
     pub priority_view_recent_capacity: usize,
+    #[arg(long, default_value_t = 2048)]
+    pub triage_queue_capacity: usize,
+    #[arg(long, default_value_t = 8)]
+    pub triage_workers: usize,
+    #[arg(long, default_value_t = 32768u64)]
+    pub triage_suspicious_small_artifact_max_bytes: u64,
+    #[arg(long, default_value_t = 67108864u64)]
+    pub triage_ephemeral_scan_max_artifact_bytes: u64,
+    #[arg(long, default_value_t = 300)]
+    pub triage_dropped_audit_interval_secs: u64,
+    #[arg(long, default_value_t = 24)]
+    pub triage_dropped_audit_window_hours: u64,
+    #[arg(long, default_value_t = 3)]
+    pub triage_dropped_audit_sample_size: usize,
+    #[arg(long, default_value_t = 6)]
+    pub triage_dropped_backfill_batch_size: usize,
+    #[arg(long, default_value_t = 5000)]
+    pub triage_dropped_history_size: usize,
     #[arg(long, default_value_t = 1024)]
     pub capture_queue_capacity: usize,
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 2)]
     pub capture_workers: usize,
+    #[arg(long, default_value_t = 21600)]
+    pub artifact_cache_ttl_secs: u64,
+    #[arg(long, default_value_t = 21474836480u64)]
+    pub artifact_cache_max_bytes: u64,
+    #[arg(long, default_value_t = 300)]
+    pub artifact_cache_sweep_interval_secs: u64,
     #[arg(long, default_value_t = DEFAULT_DIFF_QUEUE_CAPACITY)]
     pub diff_queue_capacity: usize,
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 1)]
     pub diff_workers: usize,
     #[arg(long, default_value_t = false, action = ArgAction::Set)]
     pub diff_include_patches: bool,
@@ -102,11 +128,17 @@ pub struct RunArgs {
     pub diff_backfill_lineage: bool,
     #[arg(long, default_value_t = 30)]
     pub poll_interval_secs: u64,
+    #[arg(long, default_value_t = 200)]
+    pub source_min_request_interval_ms: u64,
+    #[arg(long, default_value_t = 1)]
+    pub source_backoff_initial_secs: u64,
+    #[arg(long, default_value_t = 60)]
+    pub source_backoff_max_secs: u64,
     #[arg(long, default_value_t = 5000)]
     pub recent_key_capacity: usize,
     #[arg(long, default_value_t = 250)]
     pub npm_batch_size: u32,
-    #[arg(long, default_value_t = 12)]
+    #[arg(long, default_value_t = 6)]
     pub npm_packument_concurrency: usize,
     #[arg(long, default_value_t = 900)]
     pub npm_recent_publish_window_secs: u64,
@@ -133,6 +165,9 @@ impl RunArgs {
             ecosystems: self.ecosystems,
             state_dir: self.state_dir,
             data_dir: self.data_dir.clone(),
+            health: supply_stream_core::config::HealthConfig {
+                bind: self.health_bind,
+            },
             priority: PriorityConfig {
                 score_file: score_file.clone(),
                 graph_file: graph_file.clone(),
@@ -176,12 +211,33 @@ impl RunArgs {
             channel_capacity: self.channel_capacity,
             runtime_stats_interval: (self.runtime_stats_interval_secs > 0)
                 .then(|| Duration::from_secs(self.runtime_stats_interval_secs)),
+            triage: TriageConfig {
+                queue_capacity: self.triage_queue_capacity,
+                worker_concurrency: self.triage_workers,
+                suspicious_small_artifact_max_bytes: self
+                    .triage_suspicious_small_artifact_max_bytes,
+                ephemeral_scan_max_artifact_bytes: self.triage_ephemeral_scan_max_artifact_bytes,
+                dropped_audit_interval: (self.triage_dropped_audit_interval_secs > 0)
+                    .then(|| Duration::from_secs(self.triage_dropped_audit_interval_secs)),
+                dropped_audit_window: Duration::from_secs(
+                    self.triage_dropped_audit_window_hours.saturating_mul(3600),
+                ),
+                dropped_audit_sample_size: self.triage_dropped_audit_sample_size,
+                dropped_backfill_batch_size: self.triage_dropped_backfill_batch_size,
+                dropped_history_size: self.triage_dropped_history_size,
+            },
             capture: CaptureConfig {
                 queue_capacity: self.capture_queue_capacity,
                 worker_concurrency: self.capture_workers,
                 data_dir: self.data_dir.clone(),
                 observed_event_log_path: ledger::observed_ledger_path(&self.data_dir),
                 capture_dir: self.data_dir.join("captures"),
+                staging_dir: self.data_dir.join("staging-captures"),
+                staging_cache_ttl: Duration::from_secs(self.artifact_cache_ttl_secs),
+                staging_cache_max_bytes: self.artifact_cache_max_bytes,
+                staging_cache_sweep_interval: Duration::from_secs(
+                    self.artifact_cache_sweep_interval_secs,
+                ),
                 graph_file,
                 pypi_provenance: self.capture_pypi_provenance,
                 github_api_base: "https://api.github.com".to_string(),
@@ -203,14 +259,35 @@ impl RunArgs {
                 recent_publish_window: Duration::from_secs(self.npm_recent_publish_window_secs),
                 idle_delay: Duration::from_secs(self.npm_idle_delay_secs),
                 recent_key_capacity: self.recent_key_capacity,
+                resilience: supply_stream_core::config::SourceResilienceConfig {
+                    min_request_interval: Duration::from_millis(
+                        self.source_min_request_interval_ms,
+                    ),
+                    backoff_initial: Duration::from_secs(self.source_backoff_initial_secs),
+                    backoff_max: Duration::from_secs(self.source_backoff_max_secs),
+                },
             },
             pypi: PypiConfig {
                 poll_interval: Duration::from_secs(self.poll_interval_secs),
                 recent_key_capacity: self.recent_key_capacity,
+                resilience: supply_stream_core::config::SourceResilienceConfig {
+                    min_request_interval: Duration::from_millis(
+                        self.source_min_request_interval_ms,
+                    ),
+                    backoff_initial: Duration::from_secs(self.source_backoff_initial_secs),
+                    backoff_max: Duration::from_secs(self.source_backoff_max_secs),
+                },
             },
             crates_io: CratesConfig {
                 poll_interval: Duration::from_secs(self.poll_interval_secs),
                 recent_key_capacity: self.recent_key_capacity,
+                resilience: supply_stream_core::config::SourceResilienceConfig {
+                    min_request_interval: Duration::from_millis(
+                        self.source_min_request_interval_ms,
+                    ),
+                    backoff_initial: Duration::from_secs(self.source_backoff_initial_secs),
+                    backoff_max: Duration::from_secs(self.source_backoff_max_secs),
+                },
             },
         }
     }
@@ -251,6 +328,16 @@ pub enum HistoryCommand {
         json: bool,
     },
     Stats {
+        #[arg(long)]
+        json: bool,
+    },
+    Report {
+        #[arg(long)]
+        ecosystem: Option<Ecosystem>,
+        #[arg(long, default_value_t = 24)]
+        since_hours: u64,
+        #[arg(long)]
+        limit: Option<usize>,
         #[arg(long)]
         json: bool,
     },
@@ -316,10 +403,40 @@ pub enum HistoryCommand {
         #[arg(long)]
         json: bool,
     },
+    RetryCaptures {
+        #[arg(long, default_value_t = 8)]
+        workers: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    RetrySkippedCaptures {
+        #[arg(long)]
+        ecosystem: Option<Ecosystem>,
+        #[arg(long)]
+        package: Option<String>,
+        #[arg(long, default_value_t = 72)]
+        since_hours: u64,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long, default_value_t = 8)]
+        workers: usize,
+        #[arg(long)]
+        json: bool,
+    },
     Bundle {
         event_id: String,
         #[arg(long)]
         write: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    RepairBundles {
+        #[arg(long)]
+        ecosystem: Option<Ecosystem>,
+        #[arg(long, default_value_t = 24)]
+        since_hours: u64,
+        #[arg(long)]
+        limit: Option<usize>,
         #[arg(long)]
         json: bool,
     },
@@ -332,6 +449,12 @@ pub enum HistoryCommand {
         limit: Option<usize>,
         #[arg(long)]
         write_missing_bundles: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    DetectionEval {
+        #[arg(long, default_value = "fixtures/detection/corpus.json")]
+        manifest: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -634,12 +757,16 @@ pub enum PriorityCommand {
         base_input: Vec<PathBuf>,
         #[arg(long, default_value_t = 5000)]
         npm_page_size: usize,
+        #[arg(long)]
+        npm_start_key: Option<String>,
         #[arg(long, default_value_t = 10000)]
         npm_limit: usize,
         #[arg(long, default_value_t = 100000)]
         pypi_limit: usize,
         #[arg(long, default_value_t = 100)]
         crates_page_size: usize,
+        #[arg(long, default_value_t = 1)]
+        crates_start_page: usize,
         #[arg(long, default_value_t = 10000)]
         crates_limit: usize,
         #[arg(long, default_value_t = 5)]
@@ -669,6 +796,10 @@ pub enum PriorityCommand {
         progress_file: PathBuf,
         #[arg(long, default_value_t = 500)]
         batch_size: usize,
+        #[arg(long, default_value_t = 6)]
+        recent_stub_hours: u64,
+        #[arg(long, default_value_t = 1000)]
+        recent_stub_limit: usize,
         #[arg(long, default_value_t = 1)]
         iterations: usize,
         #[arg(long)]

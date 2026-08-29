@@ -30,6 +30,20 @@ struct Inner {
     priority_medium: AtomicU64,
     priority_low: AtomicU64,
     priority_unknown: AtomicU64,
+    triage_enqueued: AtomicU64,
+    triage_started: AtomicU64,
+    triage_completed: AtomicU64,
+    triage_failed: AtomicU64,
+    triage_dropped: AtomicU64,
+    triage_promoted: AtomicU64,
+    triage_queue_wait_us: AtomicU64,
+    triage_run_us: AtomicU64,
+    triage_run_max_us: AtomicU64,
+    staging_cache_entries: AtomicU64,
+    staging_cache_bytes: AtomicU64,
+    staging_cache_pruned: AtomicU64,
+    staging_cache_promoted: AtomicU64,
+    staging_cache_discarded: AtomicU64,
     capture_enqueued: AtomicU64,
     capture_skipped: AtomicU64,
     capture_started: AtomicU64,
@@ -60,6 +74,22 @@ pub struct RuntimeSnapshot {
     pub priority_medium: u64,
     pub priority_low: u64,
     pub priority_unknown: u64,
+    pub triage_enqueued: u64,
+    pub triage_started: u64,
+    pub triage_completed: u64,
+    pub triage_failed: u64,
+    pub triage_dropped: u64,
+    pub triage_promoted: u64,
+    pub triage_queue_backlog: u64,
+    pub triage_in_flight: u64,
+    pub triage_queue_avg_ms: f64,
+    pub triage_run_avg_ms: f64,
+    pub triage_run_max_ms: f64,
+    pub staging_cache_entries: u64,
+    pub staging_cache_bytes: u64,
+    pub staging_cache_pruned: u64,
+    pub staging_cache_promoted: u64,
+    pub staging_cache_discarded: u64,
     pub capture_enqueued: u64,
     pub capture_skipped: u64,
     pub capture_started: u64,
@@ -98,6 +128,20 @@ impl Default for RuntimeStats {
                 priority_medium: AtomicU64::new(0),
                 priority_low: AtomicU64::new(0),
                 priority_unknown: AtomicU64::new(0),
+                triage_enqueued: AtomicU64::new(0),
+                triage_started: AtomicU64::new(0),
+                triage_completed: AtomicU64::new(0),
+                triage_failed: AtomicU64::new(0),
+                triage_dropped: AtomicU64::new(0),
+                triage_promoted: AtomicU64::new(0),
+                triage_queue_wait_us: AtomicU64::new(0),
+                triage_run_us: AtomicU64::new(0),
+                triage_run_max_us: AtomicU64::new(0),
+                staging_cache_entries: AtomicU64::new(0),
+                staging_cache_bytes: AtomicU64::new(0),
+                staging_cache_pruned: AtomicU64::new(0),
+                staging_cache_promoted: AtomicU64::new(0),
+                staging_cache_discarded: AtomicU64::new(0),
                 capture_enqueued: AtomicU64::new(0),
                 capture_skipped: AtomicU64::new(0),
                 capture_started: AtomicU64::new(0),
@@ -162,8 +206,64 @@ impl RuntimeStats {
         self.inner.capture_enqueued.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_triage_enqueued(&self) {
+        self.inner.triage_enqueued.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_triage_started(&self, queue_wait: Duration) {
+        self.inner.triage_started.fetch_add(1, Ordering::Relaxed);
+        add_duration(&self.inner.triage_queue_wait_us, queue_wait);
+    }
+
+    pub fn record_triage_completed(&self, duration: Duration) {
+        self.inner.triage_completed.fetch_add(1, Ordering::Relaxed);
+        add_duration(&self.inner.triage_run_us, duration);
+        update_max(&self.inner.triage_run_max_us, duration);
+    }
+
+    pub fn record_triage_failed(&self, duration: Duration) {
+        self.inner.triage_failed.fetch_add(1, Ordering::Relaxed);
+        add_duration(&self.inner.triage_run_us, duration);
+        update_max(&self.inner.triage_run_max_us, duration);
+    }
+
+    pub fn record_triage_promoted(&self) {
+        self.inner.triage_promoted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_triage_dropped(&self) {
+        self.inner.triage_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_capture_skipped(&self) {
         self.inner.capture_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_staging_cache_snapshot(&self, entries: usize, bytes: u64) {
+        self.inner
+            .staging_cache_entries
+            .store(entries.min(u64::MAX as usize) as u64, Ordering::Relaxed);
+        self.inner
+            .staging_cache_bytes
+            .store(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_staging_cache_pruned(&self, count: usize) {
+        self.inner
+            .staging_cache_pruned
+            .fetch_add(count.min(u64::MAX as usize) as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_staging_cache_promoted(&self) {
+        self.inner
+            .staging_cache_promoted
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_staging_cache_discarded(&self) {
+        self.inner
+            .staging_cache_discarded
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_capture_started(&self, queue_wait: Duration) {
@@ -218,6 +318,17 @@ impl RuntimeStats {
         let priority_medium = self.inner.priority_medium.load(Ordering::Relaxed);
         let priority_low = self.inner.priority_low.load(Ordering::Relaxed);
         let priority_unknown = self.inner.priority_unknown.load(Ordering::Relaxed);
+        let triage_enqueued = self.inner.triage_enqueued.load(Ordering::Relaxed);
+        let triage_started = self.inner.triage_started.load(Ordering::Relaxed);
+        let triage_completed = self.inner.triage_completed.load(Ordering::Relaxed);
+        let triage_failed = self.inner.triage_failed.load(Ordering::Relaxed);
+        let triage_dropped = self.inner.triage_dropped.load(Ordering::Relaxed);
+        let triage_promoted = self.inner.triage_promoted.load(Ordering::Relaxed);
+        let staging_cache_entries = self.inner.staging_cache_entries.load(Ordering::Relaxed);
+        let staging_cache_bytes = self.inner.staging_cache_bytes.load(Ordering::Relaxed);
+        let staging_cache_pruned = self.inner.staging_cache_pruned.load(Ordering::Relaxed);
+        let staging_cache_promoted = self.inner.staging_cache_promoted.load(Ordering::Relaxed);
+        let staging_cache_discarded = self.inner.staging_cache_discarded.load(Ordering::Relaxed);
         let capture_enqueued = self.inner.capture_enqueued.load(Ordering::Relaxed);
         let capture_skipped = self.inner.capture_skipped.load(Ordering::Relaxed);
         let capture_started = self.inner.capture_started.load(Ordering::Relaxed);
@@ -249,6 +360,29 @@ impl RuntimeStats {
             priority_medium,
             priority_low,
             priority_unknown,
+            triage_enqueued,
+            triage_started,
+            triage_completed,
+            triage_failed,
+            triage_dropped,
+            triage_promoted,
+            triage_queue_backlog: triage_enqueued.saturating_sub(triage_started),
+            triage_in_flight: triage_started
+                .saturating_sub(triage_completed.saturating_add(triage_failed)),
+            triage_queue_avg_ms: average_ms(
+                self.inner.triage_queue_wait_us.load(Ordering::Relaxed),
+                triage_started,
+            ),
+            triage_run_avg_ms: average_ms(
+                self.inner.triage_run_us.load(Ordering::Relaxed),
+                triage_completed.saturating_add(triage_failed),
+            ),
+            triage_run_max_ms: micros_to_ms(self.inner.triage_run_max_us.load(Ordering::Relaxed)),
+            staging_cache_entries,
+            staging_cache_bytes,
+            staging_cache_pruned,
+            staging_cache_promoted,
+            staging_cache_discarded,
             capture_enqueued,
             capture_skipped,
             capture_started,
@@ -300,6 +434,22 @@ impl RuntimeStats {
             priority_medium = snapshot.priority_medium,
             priority_low = snapshot.priority_low,
             priority_unknown = snapshot.priority_unknown,
+            triage_enqueued = snapshot.triage_enqueued,
+            triage_started = snapshot.triage_started,
+            triage_completed = snapshot.triage_completed,
+            triage_failed = snapshot.triage_failed,
+            triage_dropped = snapshot.triage_dropped,
+            triage_promoted = snapshot.triage_promoted,
+            triage_queue_backlog = snapshot.triage_queue_backlog,
+            triage_in_flight = snapshot.triage_in_flight,
+            triage_queue_avg_ms = snapshot.triage_queue_avg_ms,
+            triage_run_avg_ms = snapshot.triage_run_avg_ms,
+            triage_run_max_ms = snapshot.triage_run_max_ms,
+            staging_cache_entries = snapshot.staging_cache_entries,
+            staging_cache_bytes = snapshot.staging_cache_bytes,
+            staging_cache_pruned = snapshot.staging_cache_pruned,
+            staging_cache_promoted = snapshot.staging_cache_promoted,
+            staging_cache_discarded = snapshot.staging_cache_discarded,
             capture_enqueued = snapshot.capture_enqueued,
             capture_skipped = snapshot.capture_skipped,
             capture_started = snapshot.capture_started,
@@ -376,5 +526,28 @@ fn rate_per_sec(count: u64, elapsed: Duration) -> f64 {
         0.0
     } else {
         count as f64 / seconds
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_keeps_capture_counters_coherent() {
+        let stats = RuntimeStats::default();
+
+        stats.record_capture_enqueued();
+        stats.record_capture_started(Duration::from_millis(1));
+        stats.record_capture_completed(Duration::from_millis(2));
+        stats.record_capture_skipped();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.capture_enqueued, 1);
+        assert_eq!(snapshot.capture_started, 1);
+        assert_eq!(snapshot.capture_completed, 1);
+        assert_eq!(snapshot.capture_skipped, 1);
+        assert_eq!(snapshot.capture_queue_backlog, 0);
+        assert_eq!(snapshot.capture_in_flight, 0);
     }
 }

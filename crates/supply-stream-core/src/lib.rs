@@ -1,14 +1,18 @@
 pub mod assessment;
 pub mod autodiff;
+pub mod bounded_map;
 pub mod bundle;
 pub mod capture;
 pub mod census;
 pub mod collector;
 pub mod config;
+pub mod content_risk;
 pub mod deps_dev;
 pub mod deps_dev_bigquery;
+pub mod detection;
 pub mod diff;
 pub mod event;
+pub mod health;
 pub mod history;
 pub mod install_scripts;
 pub mod ledger;
@@ -21,15 +25,17 @@ pub mod sink;
 pub mod sources;
 pub mod state;
 pub mod store;
+pub mod triage;
 pub mod visibility;
 
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use config::AppConfig;
+use health::HealthState;
 use ledger::EventLedger;
 use perf::RuntimeStats;
-use priority::{PriorityResolver, hydrate_local_graph_scores};
+use priority::PriorityResolver;
 use priority_view::PriorityViewTracker;
 use sink::{EventSink, StdoutNdjsonSink};
 use store::{EventOrigin, OperationalStore};
@@ -53,6 +59,7 @@ pub async fn run(config: AppConfig) -> Result<()> {
         Arc::new(EventLedger::open(config.capture.observed_event_log_path.clone()).await?);
     let store = OperationalStore::open(store::index_db_path(&config.data_dir)).await?;
     let runtime_stats = RuntimeStats::default();
+    let health_state = HealthState::new(config.ecosystems.len());
     let priority_view = PriorityViewTracker::new(config.priority_view.recent_capacity);
     if store.event_count().await? == 0 {
         let reconcile = store.reconcile_local_data(&config.data_dir).await?;
@@ -66,22 +73,14 @@ pub async fn run(config: AppConfig) -> Result<()> {
             );
         }
     }
-    let hydration =
-        hydrate_local_graph_scores(&config.priority, &config.ecosystems, 256, 128).await?;
-    if hydration.hydrated_scores > 0 {
-        info!(
-            graph_packages = hydration.graph_packages,
-            existing_scores = hydration.existing_scores,
-            missing_graph_packages = hydration.missing_graph_packages,
-            hydrated_scores = hydration.hydrated_scores,
-            batches = hydration.batches,
-            "hydrated local graph scores from operational store"
-        );
-    }
     let priority = PriorityResolver::load(&config.priority).await?;
     let source_shutdown = CancellationToken::new();
+    let health_shutdown = CancellationToken::new();
     let perf_shutdown = CancellationToken::new();
+    let staging_cache_shutdown = CancellationToken::new();
+    let dropped_audit_shutdown = CancellationToken::new();
     let (tx, mut rx) = mpsc::channel(config.channel_capacity);
+    let (triage_tx, triage_rx) = mpsc::channel(config.triage.queue_capacity);
     let (capture_tx, capture_rx) = mpsc::channel(config.capture.queue_capacity);
     let (diff_tx, diff_rx) = mpsc::channel(config.autodiff.queue_capacity);
     let mut handles = Vec::new();
@@ -96,29 +95,95 @@ pub async fn run(config: AppConfig) -> Result<()> {
         config.priority_view.top_limit,
         perf_shutdown.clone(),
     ));
-    let capture_worker = tokio::spawn(
-        capture::CaptureWorker::new(
-            http.clone(),
-            config.capture.clone(),
+    let health_task = config.health.bind.map(|bind| {
+        tokio::spawn(health::run_server(
+            bind,
+            runtime_stats.clone(),
+            health_state.clone(),
+            health_shutdown.clone(),
+        ))
+    });
+    let capture_worker_health = health_state.clone();
+    let capture_http = http.clone();
+    let capture_config = config.capture.clone();
+    let capture_priority = priority.clone();
+    let capture_sink = sink.clone();
+    let capture_store = store.clone();
+    let capture_runtime_stats = runtime_stats.clone();
+    let capture_diff_tx = diff_tx.clone();
+    let capture_worker = tokio::spawn(async move {
+        let result = capture::CaptureWorker::new(
+            capture_http,
+            capture_config,
             capture_rx,
-            Some(diff_tx.clone()),
-            Some(priority.clone()),
-            Some(sink.clone()),
-            store.clone(),
-            runtime_stats.clone(),
+            Some(capture_diff_tx),
+            Some(capture_priority),
+            Some(capture_sink),
+            capture_store,
+            capture_runtime_stats,
         )
-        .run(),
-    );
-    let diff_worker = tokio::spawn(
-        autodiff::DiffWorker::new(
-            config.autodiff.clone(),
+        .run_requests_only()
+        .await;
+        capture_worker_health.record_capture_worker_exit(result.is_ok());
+        result
+    });
+    let staging_cache_config = config.capture.clone();
+    let staging_cache_task = tokio::spawn(capture::run_staging_cache_sweeper(
+        staging_cache_config,
+        runtime_stats.clone(),
+        staging_cache_shutdown.clone(),
+    ));
+    let triage_worker_health = health_state.clone();
+    let triage_http = http.clone();
+    let triage_config = config.triage.clone();
+    let triage_store = store.clone();
+    let triage_capture_tx = capture_tx.clone();
+    let triage_priority = Some(priority.clone());
+    let triage_runtime_stats = runtime_stats.clone();
+    let triage_worker = tokio::spawn(async move {
+        let result = triage::TriageWorker::new(
+            triage_http,
+            triage_config,
+            triage_rx,
+            triage_capture_tx,
+            triage_priority,
+            triage_store,
+            triage_runtime_stats,
+        )
+        .run()
+        .await;
+        triage_worker_health.record_triage_worker_exit(result.is_ok());
+        result
+    });
+    let dropped_audit_config = config.triage.clone();
+    let dropped_audit_store = store.clone();
+    let dropped_audit_capture_tx = capture_tx.clone();
+    let dropped_audit_runtime_stats = runtime_stats.clone();
+    let dropped_audit_task = tokio::spawn(triage::run_dropped_capture_audit_loop(
+        dropped_audit_config,
+        dropped_audit_store,
+        dropped_audit_capture_tx,
+        dropped_audit_runtime_stats,
+        dropped_audit_shutdown.clone(),
+    ));
+    let diff_worker_health = health_state.clone();
+    let diff_config = config.autodiff.clone();
+    let diff_store = store.clone();
+    let diff_runtime_stats = runtime_stats.clone();
+    let diff_sink = sink.clone();
+    let diff_worker = tokio::spawn(async move {
+        let result = autodiff::DiffWorker::new(
+            diff_config,
             diff_rx,
-            store.clone(),
-            runtime_stats.clone(),
-            Some(sink.clone()),
+            diff_store,
+            diff_runtime_stats,
+            Some(diff_sink),
         )
-        .run(),
-    );
+        .run()
+        .await;
+        diff_worker_health.record_diff_worker_exit(result.is_ok());
+        result
+    });
 
     for source in sources::build_sources(
         &config,
@@ -128,7 +193,15 @@ pub async fn run(config: AppConfig) -> Result<()> {
         source_shutdown.clone(),
     ) {
         let source_name = source.name();
-        handles.push((source_name, tokio::spawn(async move { source.run().await })));
+        let source_health = health_state.clone();
+        handles.push((
+            source_name,
+            tokio::spawn(async move {
+                let result = source.run().await;
+                source_health.record_source_exit(result.is_ok());
+                result
+            }),
+        ));
     }
     drop(tx);
 
@@ -155,13 +228,12 @@ pub async fn run(config: AppConfig) -> Result<()> {
                     let graph = priority
                         .emitted_graph_evidence(event.ecosystem, &event.package)
                         .await;
-                    let capture_requested = event.capture_requested_with_graph(&graph);
                     let diff_requested = event.diff_requested_with_graph(&graph);
-                    let emitted = event.emitted_view(graph);
+                    let emitted = event.emitted_view(graph.clone());
                     sink.publish(&emitted).await?;
                     runtime_stats.record_sink_publish(started.elapsed());
 
-                    if capture_requested {
+                    if matches!(priority_snapshot.tier, crate::priority::PriorityTier::High) {
                         let capture_request =
                             capture::CaptureRequest::observed(event, diff_requested);
                         if let Err(error) = capture_tx.send(capture_request).await {
@@ -173,8 +245,16 @@ pub async fn run(config: AppConfig) -> Result<()> {
                             }
                         }
                     } else {
-                        runtime_stats.record_capture_skipped();
-                        runtime_stats.record_diff_skipped();
+                        let triage_request =
+                            triage::TriageRequest::observed(event, graph, diff_requested);
+                        if let Err(error) = triage_tx.send(triage_request).await {
+                            warn!(error = %error, "triage worker channel closed");
+                        } else {
+                            runtime_stats.record_triage_enqueued();
+                            if !diff_requested {
+                            runtime_stats.record_diff_skipped();
+                            }
+                        }
                     }
                 }
                 None => break,
@@ -182,10 +262,18 @@ pub async fn run(config: AppConfig) -> Result<()> {
             result = tokio::signal::ctrl_c(), if !shutting_down => {
                 result.context("failed to listen for ctrl-c")?;
                 info!("received shutdown signal");
+                health_state.mark_shutting_down();
                 source_shutdown.cancel();
                 shutting_down = true;
             }
         }
+    }
+
+    drop(triage_tx);
+    match triage_worker.await {
+        Ok(Ok(())) => info!("triage worker stopped"),
+        Ok(Err(error)) => warn!(error = %error, "triage worker exited with error"),
+        Err(error) => warn!(error = %error, "triage worker task join failed"),
     }
 
     drop(capture_tx);
@@ -214,8 +302,28 @@ pub async fn run(config: AppConfig) -> Result<()> {
     }
 
     perf_shutdown.cancel();
+    health_shutdown.cancel();
+    staging_cache_shutdown.cancel();
+    dropped_audit_shutdown.cancel();
     let _ = perf_task.await;
     let _ = priority_view_task.await;
+    match staging_cache_task.await {
+        Ok(Ok(())) => info!("staging cache sweeper stopped"),
+        Ok(Err(error)) => warn!(error = %error, "staging cache sweeper exited with error"),
+        Err(error) => warn!(error = %error, "staging cache sweeper task join failed"),
+    }
+    if let Some(task) = health_task {
+        match task.await {
+            Ok(Ok(())) => info!("health server stopped"),
+            Ok(Err(error)) => warn!(error = %error, "health server exited with error"),
+            Err(error) => warn!(error = %error, "health server task join failed"),
+        }
+    }
+    match dropped_audit_task.await {
+        Ok(Ok(())) => info!("dropped-package audit loop stopped"),
+        Ok(Err(error)) => warn!(error = %error, "dropped-package audit loop exited with error"),
+        Err(error) => warn!(error = %error, "dropped-package audit loop task join failed"),
+    }
     runtime_stats.log_snapshot("shutdown");
     priority_view.log_snapshot("shutdown", config.priority_view.top_limit);
 

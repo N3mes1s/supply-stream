@@ -11,18 +11,19 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{sync::mpsc, task::JoinSet, time::sleep};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::{
     bundle,
     config::CaptureConfig,
+    content_risk::{captured_content_risk, scan_captured_release},
     event::{
         Ecosystem, EmittedPrioritySignal, EmittedRepositorySignal, PackageReleaseEvent,
         RepositorySignalSeverity,
     },
-    install_scripts::{
-        has_npm_install_script, npm_install_scripts_benign, npm_install_scripts_longstanding,
-    },
+    history,
+    install_scripts::{has_npm_install_script, npm_install_scripts_benign},
     ledger,
     perf::RuntimeStats,
     priority::{PriorityResolver, PrioritySource, PriorityUpdate, normalize_package_name},
@@ -38,6 +39,20 @@ const METADATA_RETRY_DELAY_MS: u64 = 250;
 const METADATA_BODY_PREVIEW_BYTES: usize = 256;
 static LOCAL_GRAPH_APPEND_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+#[derive(Debug, Clone)]
+struct StagingCacheEntry {
+    path: PathBuf,
+    modified_at: std::time::SystemTime,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StagingCacheStats {
+    entries: usize,
+    bytes: u64,
+    pruned_dirs: usize,
+}
 
 #[derive(Debug)]
 struct MetadataFetchError {
@@ -62,10 +77,28 @@ pub struct CaptureWorker {
 }
 
 #[derive(Debug, Clone)]
+struct PostCaptureRequest {
+    event: PackageReleaseEvent,
+    origin: EventOrigin,
+    notify_diff: bool,
+    retention: CaptureRetention,
+    capture_dir: PathBuf,
+    final_capture_dir: PathBuf,
+    capture: CapturedRelease,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureRetention {
+    Permanent,
+    Ephemeral,
+}
+
+#[derive(Debug, Clone)]
 pub struct CaptureRequest {
     pub event: PackageReleaseEvent,
     pub origin: EventOrigin,
     pub notify_diff: bool,
+    pub retention: CaptureRetention,
     pub enqueued_at: Instant,
 }
 
@@ -75,6 +108,17 @@ impl CaptureRequest {
             event,
             origin: EventOrigin::Observed,
             notify_diff,
+            retention: CaptureRetention::Permanent,
+            enqueued_at: Instant::now(),
+        }
+    }
+
+    pub fn triaged(event: PackageReleaseEvent, notify_diff: bool) -> Self {
+        Self {
+            event,
+            origin: EventOrigin::Observed,
+            notify_diff,
+            retention: CaptureRetention::Ephemeral,
             enqueued_at: Instant::now(),
         }
     }
@@ -84,6 +128,7 @@ impl CaptureRequest {
             event,
             origin: EventOrigin::Reconstructed,
             notify_diff,
+            retention: CaptureRetention::Permanent,
             enqueued_at: Instant::now(),
         }
     }
@@ -115,20 +160,51 @@ impl CaptureWorker {
         }
     }
 
-    pub async fn run(mut self) -> Result<()> {
+    pub async fn run(self) -> Result<()> {
         self.backfill_from_ledger().await?;
+        self.run_requests_only().await
+    }
 
-        let mut in_flight = JoinSet::new();
+    pub async fn run_requests_only(mut self) -> Result<()> {
+        self.run_requests_loop().await;
+        Ok(())
+    }
+
+    async fn run_requests_loop(&mut self) {
+        let mut capture_in_flight = JoinSet::new();
+        let mut post_in_flight = JoinSet::new();
         let concurrency = self.context.config.worker_concurrency.max(1);
+        let post_concurrency = concurrency;
 
         while let Some(request) = self.rx.recv().await {
-            self.spawn_capture(&mut in_flight, request);
-            self.drain_to_limit(&mut in_flight, concurrency, "capture failed")
-                .await;
+            self.spawn_capture(&mut capture_in_flight, request);
+            self.drain_capture_to_limit(
+                &mut capture_in_flight,
+                &mut post_in_flight,
+                concurrency,
+                post_concurrency,
+                "capture failed",
+                "post-capture analysis failed",
+            )
+            .await;
+            self.drain_post_to_limit(
+                &mut post_in_flight,
+                post_concurrency,
+                "post-capture analysis failed",
+            )
+            .await;
         }
 
-        self.drain_all(&mut in_flight, "capture failed").await;
-        Ok(())
+        self.drain_all_captures(
+            &mut capture_in_flight,
+            &mut post_in_flight,
+            post_concurrency,
+            "capture failed",
+            "post-capture analysis failed",
+        )
+        .await;
+        self.drain_all_posts(&mut post_in_flight, "post-capture analysis failed")
+            .await;
     }
 
     async fn backfill_from_ledger(&self) -> Result<()> {
@@ -148,11 +224,24 @@ impl CaptureWorker {
         }
 
         let mut pending = 0usize;
-        let mut in_flight = JoinSet::new();
+        let mut capture_in_flight = JoinSet::new();
+        let mut post_in_flight = JoinSet::new();
         let concurrency = self.context.config.worker_concurrency.max(1);
+        let post_concurrency = concurrency;
         for event in observed_events {
             if let Some(priority) = &self.context.priority {
                 priority.seed_event_snapshot(&event).await;
+            }
+            if self
+                .context
+                .store
+                .load_release_record(&event.event_id)
+                .await?
+                .is_some_and(|record| record.capture_state == "skipped")
+            {
+                self.context.perf.record_capture_skipped();
+                self.context.perf.record_diff_skipped();
+                continue;
             }
             let capture_dir = self.context.capture_path_for_event(&event);
             if capture_dir.join("capture.json").exists() {
@@ -160,7 +249,7 @@ impl CaptureWorker {
                     .index_existing_capture(&event, EventOrigin::Observed, &capture_dir)
                     .await?;
                 if event.diff_requested() {
-                    self.context.notify_diff_worker(&event).await;
+                    self.context.notify_diff_worker(&event, None).await;
                 }
                 continue;
             }
@@ -177,16 +266,39 @@ impl CaptureWorker {
             if !notify_diff {
                 self.context.perf.record_diff_skipped();
             }
-            self.spawn_capture(&mut in_flight, CaptureRequest::observed(event, notify_diff));
-            self.drain_to_limit(
-                &mut in_flight,
+            self.spawn_capture(
+                &mut capture_in_flight,
+                CaptureRequest::observed(event, notify_diff),
+            );
+            self.drain_capture_to_limit(
+                &mut capture_in_flight,
+                &mut post_in_flight,
                 concurrency,
+                post_concurrency,
                 "ledger backfill capture failed",
+                "ledger backfill post-capture analysis failed",
+            )
+            .await;
+            self.drain_post_to_limit(
+                &mut post_in_flight,
+                post_concurrency,
+                "ledger backfill post-capture analysis failed",
             )
             .await;
         }
 
         for event in reconstructed_events {
+            if self
+                .context
+                .store
+                .load_release_record(&event.event_id)
+                .await?
+                .is_some_and(|record| record.capture_state == "skipped")
+            {
+                self.context.perf.record_capture_skipped();
+                self.context.perf.record_diff_skipped();
+                continue;
+            }
             let capture_dir = self.context.capture_path_for_event(&event);
             if capture_dir.join("capture.json").exists() {
                 self.context
@@ -197,17 +309,40 @@ impl CaptureWorker {
 
             pending += 1;
             self.context.perf.record_capture_enqueued();
-            self.spawn_capture(&mut in_flight, CaptureRequest::reconstructed(event, false));
-            self.drain_to_limit(
-                &mut in_flight,
+            self.spawn_capture(
+                &mut capture_in_flight,
+                CaptureRequest::reconstructed(event, false),
+            );
+            self.drain_capture_to_limit(
+                &mut capture_in_flight,
+                &mut post_in_flight,
                 concurrency,
+                post_concurrency,
                 "ledger backfill capture failed",
+                "ledger backfill post-capture analysis failed",
+            )
+            .await;
+            self.drain_post_to_limit(
+                &mut post_in_flight,
+                post_concurrency,
+                "ledger backfill post-capture analysis failed",
             )
             .await;
         }
 
-        self.drain_all(&mut in_flight, "ledger backfill capture failed")
-            .await;
+        self.drain_all_captures(
+            &mut capture_in_flight,
+            &mut post_in_flight,
+            post_concurrency,
+            "ledger backfill capture failed",
+            "ledger backfill post-capture analysis failed",
+        )
+        .await;
+        self.drain_all_posts(
+            &mut post_in_flight,
+            "ledger backfill post-capture analysis failed",
+        )
+        .await;
 
         if pending > 0 {
             info!(pending, "replayed uncaptured events from event ledger");
@@ -218,39 +353,119 @@ impl CaptureWorker {
 
     fn spawn_capture(
         &self,
-        in_flight: &mut JoinSet<(String, Result<()>)>,
+        in_flight: &mut JoinSet<(String, Result<Option<PostCaptureRequest>>)>,
         request: CaptureRequest,
     ) {
         let context = self.context.clone();
         in_flight.spawn(async move {
             let event_id = request.event.event_id.clone();
-            let result = context.capture_if_missing(&request).await;
+            let result = context.fetch_capture_if_missing(&request).await;
             (event_id, result)
         });
     }
 
-    async fn drain_to_limit(
+    fn spawn_post_capture(
+        &self,
+        in_flight: &mut JoinSet<(String, Result<()>)>,
+        request: PostCaptureRequest,
+    ) {
+        let context = self.context.clone();
+        in_flight.spawn(async move {
+            let event_id = request.event.event_id.clone();
+            let result = context.post_process_capture(request).await;
+            (event_id, result)
+        });
+    }
+
+    async fn drain_capture_to_limit(
+        &self,
+        capture_in_flight: &mut JoinSet<(String, Result<Option<PostCaptureRequest>>)>,
+        post_in_flight: &mut JoinSet<(String, Result<()>)>,
+        concurrency: usize,
+        post_concurrency: usize,
+        failure_message: &'static str,
+        post_failure_message: &'static str,
+    ) {
+        while capture_in_flight.len() >= concurrency {
+            self.join_next_capture(
+                capture_in_flight,
+                post_in_flight,
+                post_concurrency,
+                failure_message,
+                post_failure_message,
+            )
+            .await;
+        }
+    }
+
+    async fn drain_all_captures(
+        &self,
+        capture_in_flight: &mut JoinSet<(String, Result<Option<PostCaptureRequest>>)>,
+        post_in_flight: &mut JoinSet<(String, Result<()>)>,
+        post_concurrency: usize,
+        failure_message: &'static str,
+        post_failure_message: &'static str,
+    ) {
+        while !capture_in_flight.is_empty() {
+            self.join_next_capture(
+                capture_in_flight,
+                post_in_flight,
+                post_concurrency,
+                failure_message,
+                post_failure_message,
+            )
+            .await;
+        }
+    }
+
+    async fn drain_post_to_limit(
         &self,
         in_flight: &mut JoinSet<(String, Result<()>)>,
         concurrency: usize,
         failure_message: &'static str,
     ) {
         while in_flight.len() >= concurrency {
-            self.join_next(in_flight, failure_message).await;
+            self.join_next_post(in_flight, failure_message).await;
         }
     }
 
-    async fn drain_all(
+    async fn drain_all_posts(
         &self,
         in_flight: &mut JoinSet<(String, Result<()>)>,
         failure_message: &'static str,
     ) {
         while !in_flight.is_empty() {
-            self.join_next(in_flight, failure_message).await;
+            self.join_next_post(in_flight, failure_message).await;
         }
     }
 
-    async fn join_next(
+    async fn join_next_capture(
+        &self,
+        capture_in_flight: &mut JoinSet<(String, Result<Option<PostCaptureRequest>>)>,
+        post_in_flight: &mut JoinSet<(String, Result<()>)>,
+        post_concurrency: usize,
+        failure_message: &'static str,
+        post_failure_message: &'static str,
+    ) {
+        let Some(outcome) = capture_in_flight.join_next().await else {
+            return;
+        };
+
+        match outcome {
+            Ok((_, Ok(Some(post_request)))) => {
+                self.spawn_post_capture(post_in_flight, post_request);
+                self.drain_post_to_limit(post_in_flight, post_concurrency, post_failure_message)
+                    .await;
+            }
+            Ok((_, Ok(None))) => {}
+            Ok((event_id, Err(error))) => {
+                warn!(event_id, error = %error, "{failure_message}");
+            }
+            Err(error) => warn!(error = %error, "{failure_message} task join failed"),
+        }
+    }
+
+    async fn join_next_post(
         &self,
         in_flight: &mut JoinSet<(String, Result<()>)>,
         failure_message: &'static str,
@@ -269,23 +484,55 @@ impl CaptureWorker {
     }
 }
 
+pub async fn run_staging_cache_sweeper(
+    config: CaptureConfig,
+    perf: RuntimeStats,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    loop {
+        if let Err(error) = prune_staging_cache(&config, &perf).await {
+            warn!(
+                path = %config.staging_dir.display(),
+                error = %error,
+                "failed to prune staging cache"
+            );
+        }
+
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = sleep(config.staging_cache_sweep_interval) => {}
+        }
+    }
+
+    Ok(())
+}
+
 impl CaptureContext {
-    async fn capture_if_missing(&self, request: &CaptureRequest) -> Result<()> {
+    async fn fetch_capture_if_missing(
+        &self,
+        request: &CaptureRequest,
+    ) -> Result<Option<PostCaptureRequest>> {
         let started_at = Instant::now();
         self.perf
             .record_capture_started(request.enqueued_at.elapsed());
         let event = &request.event;
         let origin = request.origin;
         let notify_diff = request.notify_diff;
-        let capture_dir = self.capture_path_for_event(event);
-        let result: Result<()> = async {
-            if capture_dir.join("capture.json").exists() {
-                self.index_existing_capture(event, origin, &capture_dir)
+        let retention = request.retention;
+        let final_capture_dir = self.capture_path_for_event(event);
+        let capture_dir = self.capture_workspace_path_for_request(event, retention);
+        let result: Result<Option<PostCaptureRequest>> = async {
+            if final_capture_dir.join("capture.json").exists() {
+                self.index_existing_capture(event, origin, &final_capture_dir)
                     .await?;
                 if notify_diff {
-                    self.notify_diff_worker(event).await;
+                    self.notify_diff_worker(event, None).await;
                 }
-                return Ok(());
+                return Ok(None);
+            }
+
+            if matches!(retention, CaptureRetention::Ephemeral) {
+                remove_capture_dir(&capture_dir).await;
             }
 
             tokio::fs::create_dir_all(&capture_dir)
@@ -298,40 +545,29 @@ impl CaptureContext {
                 Ecosystem::Npm => self.capture_npm(event, &capture_dir).await?,
                 Ecosystem::CratesIo => self.capture_crates_io(event, &capture_dir).await?,
             };
-            let package_repository =
-                package_repository_identity_from_captured_release(event.ecosystem, &capture);
 
             write_json_pretty(&capture_dir.join("capture.json"), &capture).await?;
-            let graph_records = graph_records_from_captured_release(&capture);
-            self.append_local_graph_records(&graph_records).await?;
-            if !graph_records.is_empty() {
-                self.store.record_graph_records(&graph_records).await?;
-            }
-            if let Some(repository) = &package_repository {
+            if matches!(retention, CaptureRetention::Permanent) {
                 self.store
-                    .record_package_repository_ref(repository, Some(&capture.version))
+                    .record_capture(event, origin, &capture_dir, &capture)
                     .await?;
             }
-            if let Some(priority) = &self.priority {
-                let updates = priority.record_captured_release(&capture).await;
-                self.emit_priority_signal(event, priority, &updates).await;
-            }
-            self.store
-                .record_capture(event, origin, &capture_dir, &capture)
-                .await?;
-            self.emit_repository_signal(event, &capture).await;
-            self.emit_release_bundle(event, Some(&capture), None).await;
-            if notify_diff {
-                self.notify_diff_worker(event).await;
-            }
             debug!(event_id = event.event_id, dir = %capture_dir.display(), "captured release evidence");
-            Ok(())
+            Ok(Some(PostCaptureRequest {
+                event: event.clone(),
+                origin,
+                notify_diff,
+                retention,
+                capture_dir: capture_dir.clone(),
+                final_capture_dir: final_capture_dir.clone(),
+                capture,
+            }))
         }
         .await;
 
         let elapsed = started_at.elapsed();
         match &result {
-            Ok(()) => self.perf.record_capture_completed(elapsed),
+            Ok(_) => self.perf.record_capture_completed(elapsed),
             Err(error) => {
                 self.perf.record_capture_failed(elapsed);
                 self.write_capture_error_file(&capture_dir, event, error)
@@ -341,6 +577,98 @@ impl CaptureContext {
                     .await?;
             }
         }
+        result
+    }
+
+    async fn post_process_capture(&self, request: PostCaptureRequest) -> Result<()> {
+        let event = &request.event;
+        let mut capture = request.capture;
+        let capture_dir = request.capture_dir;
+        let final_capture_dir = request.final_capture_dir;
+        let notify_diff = request.notify_diff;
+        let origin = request.origin;
+        let retention = request.retention;
+        let result: Result<()> = async {
+            if let Err(error) = materialize_primary_artifact_into_capture_dir(
+                &self.http,
+                &capture_dir,
+                &mut capture,
+            )
+            .await
+            {
+                warn!(
+                    event_id = event.event_id,
+                    error = %error,
+                    "failed to persist local artifact for capture; falling back to URL-based scan"
+                );
+            }
+            let content_risk = scan_captured_release(&self.http, &capture_dir, &capture).await;
+            set_capture_detail(&mut capture.details, "content_risk", &content_risk);
+            write_json_pretty(&capture_dir.join("capture.json"), &capture).await?;
+
+            let graph_records = graph_records_from_captured_release(&capture);
+            self.append_local_graph_records(&graph_records).await?;
+            if !graph_records.is_empty() {
+                self.store.record_graph_records(&graph_records).await?;
+            }
+            if let Some(repository) =
+                package_repository_identity_from_captured_release(event.ecosystem, &capture)
+            {
+                self.store
+                    .record_package_repository_ref(&repository, Some(&capture.version))
+                    .await?;
+            }
+            if let Some(priority) = &self.priority {
+                let updates = priority.record_captured_release(&capture).await;
+                self.emit_priority_signal(event, priority, &updates).await;
+            }
+            let force_diff_reason = if notify_diff {
+                None
+            } else {
+                self.diff_escalation_reason(event, &capture).await?
+            };
+            let retain_capture = matches!(retention, CaptureRetention::Permanent)
+                || should_retain_captured_release(&capture)
+                || notify_diff
+                || force_diff_reason.is_some();
+            if !retain_capture {
+                self.perf.record_staging_cache_discarded();
+                self.store
+                    .mark_capture_skipped(
+                        &event.event_id,
+                        "post-analysis dropped low-signal triaged capture",
+                    )
+                    .await?;
+                remove_capture_dir(&capture_dir).await;
+                return Ok(());
+            }
+            let retained_capture_dir = if matches!(retention, CaptureRetention::Ephemeral) {
+                promote_capture_dir(&capture_dir, &final_capture_dir).await?;
+                self.perf.record_staging_cache_promoted();
+                final_capture_dir.clone()
+            } else {
+                capture_dir.clone()
+            };
+            self.store
+                .record_capture(event, origin, &retained_capture_dir, &capture)
+                .await?;
+            self.emit_repository_signal(event, &capture).await;
+            self.emit_release_bundle(event, Some(&capture), None).await;
+            if notify_diff || force_diff_reason.is_some() {
+                self.notify_diff_worker(event, force_diff_reason).await;
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(error) = &result {
+            self.write_capture_error_file(&capture_dir, event, error)
+                .await;
+            self.store
+                .mark_capture_failed(&event.event_id, &error.to_string())
+                .await?;
+        }
+
         result
     }
 
@@ -370,15 +698,139 @@ impl CaptureContext {
         }
     }
 
-    async fn notify_diff_worker(&self, event: &PackageReleaseEvent) {
+    async fn notify_diff_worker(&self, event: &PackageReleaseEvent, force_reason: Option<String>) {
         let Some(diff_tx) = &self.diff_tx else {
             return;
         };
-        let request = crate::autodiff::DiffRequest::new(event.clone());
+        let request = match force_reason {
+            Some(reason) => crate::autodiff::DiffRequest::forced(event.clone(), reason),
+            None => crate::autodiff::DiffRequest::new(event.clone()),
+        };
         if let Err(error) = diff_tx.send(request).await {
             warn!(event_id = event.event_id, error = %error, "diff worker channel closed");
         } else {
             self.perf.record_diff_enqueued();
+        }
+    }
+
+    async fn diff_escalation_reason(
+        &self,
+        event: &PackageReleaseEvent,
+        capture: &CapturedRelease,
+    ) -> Result<Option<String>> {
+        let prerelease = is_prerelease_version(&event.version);
+        let install_time_execution = capture_has_install_time_execution(capture);
+        let install_time_execution_longstanding =
+            capture_has_longstanding_install_time_execution(capture);
+        let install_time_execution_benign = capture_has_benign_install_time_execution(capture);
+        let risky_install_time_execution = install_time_execution
+            && !install_time_execution_longstanding
+            && !install_time_execution_benign;
+        let graph = self
+            .store
+            .load_graph_evidence(event.ecosystem, &event.package)
+            .await?;
+        let downstream_impact = matches!(
+            event.priority_snapshot().tier,
+            crate::priority::PriorityTier::Medium | crate::priority::PriorityTier::High
+        ) || graph
+            .as_ref()
+            .is_some_and(|graph| graph.reverse_dependents_seen > 0);
+        let metadata_risk = captured_metadata_risk(capture);
+        let content_risk = captured_content_risk(capture);
+
+        if metadata_risk.suspicious {
+            return Ok(Some(format!(
+                "post-capture diff escalation: malware-shaped metadata [{}]",
+                metadata_risk.factors.join(", ")
+            )));
+        }
+
+        if content_risk.suspicious {
+            return Ok(Some(format!(
+                "post-capture diff escalation: malware-shaped content [{}]",
+                content_risk.factors.join(", ")
+            )));
+        }
+
+        if risky_install_time_execution {
+            return Ok(Some(
+                "post-capture diff escalation: install-time execution observed".to_string(),
+            ));
+        }
+
+        if capture
+            .upstream_repository
+            .as_ref()
+            .is_some_and(|repository| repository.suspicious)
+            && !prerelease
+            && downstream_impact
+        {
+            return Ok(Some(
+                "post-capture diff escalation: stable upstream mismatch on impacted package"
+                    .to_string(),
+            ));
+        }
+
+        let new_dependencies = self
+            .new_dependencies_since_previous_capture(event, capture)
+            .await?;
+        if !new_dependencies.is_empty() && downstream_impact {
+            return Ok(Some(format!(
+                "post-capture diff escalation: introduced new dependencies [{}]",
+                new_dependencies.join(", ")
+            )));
+        }
+
+        Ok(None)
+    }
+
+    async fn new_dependencies_since_previous_capture(
+        &self,
+        event: &PackageReleaseEvent,
+        capture: &CapturedRelease,
+    ) -> Result<Vec<String>> {
+        let current_dependencies = captured_dependency_names(capture);
+        if current_dependencies.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut entries =
+            history::load_package_history(&self.config.data_dir, event.ecosystem, &event.package)
+                .await?;
+        let mut previous_capture =
+            previous_captured_release_from_history(&entries, &event.version).cloned();
+        if previous_capture.is_none() {
+            let _ = history::backfill_previous_lineage(
+                &self.config.data_dir,
+                event.ecosystem,
+                &event.package,
+                &event.version,
+            )
+            .await?;
+            entries = history::load_package_history(
+                &self.config.data_dir,
+                event.ecosystem,
+                &event.package,
+            )
+            .await?;
+            previous_capture =
+                previous_captured_release_from_history(&entries, &event.version).cloned();
+        }
+
+        if let Some(previous_capture) = previous_capture {
+            let previous_dependencies = captured_dependency_names(&previous_capture)
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let mut introduced = current_dependencies
+                .into_iter()
+                .filter(|dependency| !previous_dependencies.contains(dependency))
+                .collect::<Vec<_>>();
+            introduced.sort();
+            introduced.dedup();
+            Ok(introduced)
+        } else {
+            Ok(Vec::new())
         }
     }
 
@@ -470,6 +922,9 @@ impl CaptureContext {
         let Some(sink) = &self.sink else {
             return;
         };
+        if !bundle::should_publish_live_bundle(&bundle) {
+            return;
+        }
         if let Err(error) = sink.publish_release_bundle(&bundle).await {
             warn!(event_id = event.event_id, error = %error, "failed to publish release bundle");
         }
@@ -481,6 +936,20 @@ impl CaptureContext {
             .join(event.ecosystem.as_str())
             .join(urlencoding::encode(&event.package).into_owned())
             .join(urlencoding::encode(&event.version).into_owned())
+    }
+
+    fn capture_workspace_path_for_request(
+        &self,
+        event: &PackageReleaseEvent,
+        retention: CaptureRetention,
+    ) -> PathBuf {
+        match retention {
+            CaptureRetention::Permanent => self.capture_path_for_event(event),
+            CaptureRetention::Ephemeral => self
+                .config
+                .staging_dir
+                .join(urlencoding::encode(&event.event_id).into_owned()),
+        }
     }
 
     async fn index_existing_capture(
@@ -690,68 +1159,27 @@ impl CaptureContext {
         event: &PackageReleaseEvent,
         capture_dir: &Path,
     ) -> Result<CapturedRelease> {
-        let metadata_url = event.metadata_url.clone().unwrap_or_else(|| {
+        let packument_url = event.metadata_url.clone().unwrap_or_else(|| {
             format!(
                 "https://registry.npmjs.org/{}",
                 urlencoding::encode(&event.package)
             )
         });
-        let Some(raw) =
-            fetch_json_metadata(&self.http, &metadata_url, "npm metadata", &event.event_id).await?
+        let version_metadata_url = npm_version_metadata_url(&packument_url, &event.version);
+        let Some(version_meta) = fetch_json_metadata(
+            &self.http,
+            &version_metadata_url,
+            "npm metadata",
+            &event.event_id,
+        )
+        .await?
         else {
             return Ok(CapturedRelease::removed(event));
         };
 
-        write_json_pretty(&capture_dir.join("metadata.json"), &raw).await?;
+        write_json_pretty(&capture_dir.join("metadata.json"), &version_meta).await?;
 
-        let Some(version_meta) = raw
-            .get("versions")
-            .and_then(Value::as_object)
-            .and_then(|versions| versions.get(&event.version))
-        else {
-            let unpublished = raw
-                .pointer("/time/unpublished")
-                .cloned()
-                .unwrap_or(Value::Null);
-            return Ok(CapturedRelease {
-                event_id: event.event_id.clone(),
-                ecosystem: event.ecosystem,
-                package: event.package.clone(),
-                version: event.version.clone(),
-                observed_at: event.observed_at,
-                published_at: event.published_at,
-                captured_at: Utc::now(),
-                status: ReleaseStatus::Removed,
-                package_url: event.package_url.clone(),
-                release_url: event.release_url.clone(),
-                metadata_url: Some(metadata_url),
-                raw_metadata_path: Some("metadata.json".to_string()),
-                artifacts: Vec::new(),
-                upstream_repository: None,
-                details: json!({
-                    "unpublished": unpublished,
-                    "dist_tags": raw.get("dist-tags"),
-                    "maintainers": raw.get("maintainers")
-                }),
-            });
-        };
-        let dependencies = extract_npm_dependencies(version_meta);
-        let install_scripts_longstanding = npm_install_scripts_longstanding(&raw, &event.version);
-        let install_scripts_benign = npm_install_scripts_benign(version_meta);
-
-        let details = json!({
-            "dist_tags": raw.get("dist-tags"),
-            "maintainers": raw.get("maintainers"),
-            "publisher": version_meta.get("_npmUser"),
-            "repository": version_meta.get("repository"),
-            "dependencies": dependencies,
-            "deprecated": version_meta.get("deprecated"),
-            "scripts": version_meta.get("scripts"),
-            "has_install_scripts": has_npm_install_script(version_meta),
-            "install_scripts_longstanding": install_scripts_longstanding,
-            "install_scripts_benign": install_scripts_benign,
-            "unpublished": raw.pointer("/time/unpublished")
-        });
+        let details = build_npm_capture_details(&event.package, &version_meta);
         let upstream_repository = match repo_provenance::check_release_provenance_with_api_bases(
             &self.http,
             event.ecosystem,
@@ -784,9 +1212,9 @@ impl CaptureContext {
             status: ReleaseStatus::Active,
             package_url: event.package_url.clone(),
             release_url: event.release_url.clone(),
-            metadata_url: Some(metadata_url),
+            metadata_url: Some(version_metadata_url),
             raw_metadata_path: Some("metadata.json".to_string()),
-            artifacts: extract_npm_artifacts(event, version_meta),
+            artifacts: extract_npm_artifacts(event, &version_meta),
             upstream_repository,
             details,
         })
@@ -988,6 +1416,29 @@ pub struct CapturedRelease {
     pub details: Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct MetadataRiskSignal {
+    pub suspicious: bool,
+    pub score: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub factors: Vec<String>,
+    pub reason: String,
+}
+
+fn set_capture_detail<T>(details: &mut Value, key: &str, value: &T)
+where
+    T: Serialize,
+{
+    if !details.is_object() {
+        *details = json!({});
+    }
+    if let Some(object) = details.as_object_mut()
+        && let Ok(value) = serde_json::to_value(value)
+    {
+        object.insert(key.to_string(), value);
+    }
+}
+
 impl CapturedRelease {
     fn removed(event: &PackageReleaseEvent) -> Self {
         Self {
@@ -1008,6 +1459,242 @@ impl CapturedRelease {
             details: json!({}),
         }
     }
+}
+
+pub fn captured_metadata_risk(capture: &CapturedRelease) -> MetadataRiskSignal {
+    if let Some(signal) = capture
+        .details
+        .get("metadata_risk")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<MetadataRiskSignal>(value).ok())
+    {
+        return signal;
+    }
+
+    match capture.ecosystem {
+        Ecosystem::Npm => npm_metadata_risk_from_details(&capture.package, &capture.details),
+        Ecosystem::Pypi | Ecosystem::CratesIo => MetadataRiskSignal::default(),
+    }
+}
+
+pub async fn hydrate_release_metadata_for_priority(
+    http: &reqwest::Client,
+    event: &PackageReleaseEvent,
+) -> Result<Option<CapturedRelease>> {
+    match event.ecosystem {
+        Ecosystem::Pypi => hydrate_priority_pypi(http, event).await,
+        Ecosystem::Npm => hydrate_priority_npm(http, event).await,
+        Ecosystem::CratesIo => hydrate_priority_crates_io(http, event).await,
+    }
+}
+
+async fn hydrate_priority_pypi(
+    http: &reqwest::Client,
+    event: &PackageReleaseEvent,
+) -> Result<Option<CapturedRelease>> {
+    let metadata_url = event.metadata_url.clone().unwrap_or_else(|| {
+        format!(
+            "https://pypi.org/pypi/{}/{}/json",
+            urlencoding::encode(&event.package),
+            urlencoding::encode(&event.version)
+        )
+    });
+    let Some(raw) =
+        fetch_json_metadata(http, &metadata_url, "PyPI metadata", &event.event_id).await?
+    else {
+        return Ok(None);
+    };
+
+    let artifacts = extract_pypi_artifacts(&raw);
+    let dependencies = extract_pypi_dependencies(&raw);
+    let yanked = raw
+        .pointer("/info/yanked")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| {
+            artifacts
+                .iter()
+                .any(|artifact| artifact.yanked == Some(true))
+        });
+    let details = json!({
+        "last_serial": raw.get("last_serial"),
+        "requires_python": raw.pointer("/info/requires_python"),
+        "summary": raw.pointer("/info/summary"),
+        "home_page": raw.pointer("/info/home_page"),
+        "project_urls": raw.pointer("/info/project_urls"),
+        "dependencies": dependencies,
+        "ownership": raw.pointer("/info/ownership"),
+        "yanked": raw.pointer("/info/yanked"),
+        "yanked_reason": raw.pointer("/info/yanked_reason")
+    });
+
+    Ok(Some(CapturedRelease {
+        event_id: event.event_id.clone(),
+        ecosystem: event.ecosystem,
+        package: event.package.clone(),
+        version: event.version.clone(),
+        observed_at: event.observed_at,
+        published_at: event.published_at,
+        captured_at: Utc::now(),
+        status: if yanked {
+            ReleaseStatus::Yanked
+        } else {
+            ReleaseStatus::Active
+        },
+        package_url: event.package_url.clone(),
+        release_url: event.release_url.clone(),
+        metadata_url: Some(metadata_url),
+        raw_metadata_path: None,
+        artifacts,
+        upstream_repository: None,
+        details,
+    }))
+}
+
+async fn hydrate_priority_npm(
+    http: &reqwest::Client,
+    event: &PackageReleaseEvent,
+) -> Result<Option<CapturedRelease>> {
+    let packument_url = event.metadata_url.clone().unwrap_or_else(|| {
+        format!(
+            "https://registry.npmjs.org/{}",
+            urlencoding::encode(&event.package)
+        )
+    });
+    let version_metadata_url = npm_version_metadata_url(&packument_url, &event.version);
+    let Some(version_meta) =
+        fetch_json_metadata(http, &version_metadata_url, "npm metadata", &event.event_id).await?
+    else {
+        return Ok(None);
+    };
+
+    let details = build_npm_capture_details(&event.package, &version_meta);
+
+    Ok(Some(CapturedRelease {
+        event_id: event.event_id.clone(),
+        ecosystem: event.ecosystem,
+        package: event.package.clone(),
+        version: event.version.clone(),
+        observed_at: event.observed_at,
+        published_at: event.published_at,
+        captured_at: Utc::now(),
+        status: ReleaseStatus::Active,
+        package_url: event.package_url.clone(),
+        release_url: event.release_url.clone(),
+        metadata_url: Some(version_metadata_url),
+        raw_metadata_path: None,
+        artifacts: extract_npm_artifacts(event, &version_meta),
+        upstream_repository: None,
+        details,
+    }))
+}
+
+async fn hydrate_priority_crates_io(
+    http: &reqwest::Client,
+    event: &PackageReleaseEvent,
+) -> Result<Option<CapturedRelease>> {
+    let metadata_url = event.metadata_url.clone().unwrap_or_else(|| {
+        format!(
+            "https://crates.io/api/v1/crates/{}",
+            urlencoding::encode(&event.package)
+        )
+    });
+    let Some(raw) =
+        fetch_json_metadata(http, &metadata_url, "crates.io metadata", &event.event_id).await?
+    else {
+        return Ok(None);
+    };
+
+    let dependencies = fetch_crates_dependencies_for_priority(http, &event.package, &event.version)
+        .await
+        .unwrap_or_default();
+    let version_meta = raw
+        .get("versions")
+        .and_then(Value::as_array)
+        .and_then(|versions| {
+            versions.iter().find(|version| {
+                version
+                    .get("num")
+                    .and_then(Value::as_str)
+                    .is_some_and(|num| num == event.version)
+            })
+        })
+        .cloned();
+    let status = version_meta
+        .as_ref()
+        .and_then(|version| version.get("yanked").and_then(Value::as_bool))
+        .map(|yanked| {
+            if yanked {
+                ReleaseStatus::Yanked
+            } else {
+                ReleaseStatus::Active
+            }
+        })
+        .unwrap_or(ReleaseStatus::Unknown);
+    let details = json!({
+        "crate": raw.get("crate"),
+        "dependencies": dependencies,
+        "version": version_meta,
+    });
+
+    Ok(Some(CapturedRelease {
+        event_id: event.event_id.clone(),
+        ecosystem: event.ecosystem,
+        package: event.package.clone(),
+        version: event.version.clone(),
+        observed_at: event.observed_at,
+        published_at: event.published_at,
+        captured_at: Utc::now(),
+        status,
+        package_url: event.package_url.clone(),
+        release_url: event.release_url.clone(),
+        metadata_url: Some(metadata_url),
+        raw_metadata_path: None,
+        artifacts: extract_crates_artifacts(event, version_meta.as_ref()),
+        upstream_repository: None,
+        details,
+    }))
+}
+
+async fn fetch_crates_dependencies_for_priority(
+    http: &reqwest::Client,
+    package: &str,
+    version: &str,
+) -> Result<Vec<String>> {
+    let encoded = urlencoding::encode(package);
+    let url = format!(
+        "https://crates.io/api/v1/crates/{}/{}/dependencies",
+        encoded,
+        urlencoding::encode(version)
+    );
+    let Some(raw) = fetch_json_metadata(
+        http,
+        &url,
+        "crates.io dependency metadata",
+        &format!("crates-io:{package}@{version}"),
+    )
+    .await?
+    else {
+        return Ok(Vec::new());
+    };
+
+    Ok(raw
+        .get("dependencies")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|dependency| {
+            dependency
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_none_or(|kind| kind == "normal")
+                && !dependency
+                    .get("optional")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        })
+        .filter_map(|dependency| dependency.get("crate_id").and_then(Value::as_str))
+        .map(|name| normalize_package_name(Ecosystem::CratesIo, name))
+        .collect())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1204,6 +1891,70 @@ fn extract_crates_artifacts(
     }]
 }
 
+fn local_artifact_relative_path(filename: &str) -> PathBuf {
+    PathBuf::from("artifacts").join(filename)
+}
+
+async fn materialize_primary_artifact_into_capture_dir(
+    http: &reqwest::Client,
+    capture_dir: &Path,
+    capture: &mut CapturedRelease,
+) -> Result<()> {
+    if capture
+        .details
+        .pointer("/local_artifact/path")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let Some(artifact) = capture
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.url.is_some())
+    else {
+        return Ok(());
+    };
+    let Some(url) = artifact.url.as_deref() else {
+        return Ok(());
+    };
+
+    let relative_path = local_artifact_relative_path(&artifact.filename);
+    let destination = capture_dir.join(&relative_path);
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let response = http
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("failed to request artifact {url}"))?
+        .error_for_status()
+        .with_context(|| format!("artifact download returned an error for {url}"))?;
+    let bytes = response
+        .bytes()
+        .await
+        .with_context(|| format!("failed to read artifact body from {url}"))?;
+    tokio::fs::write(&destination, &bytes)
+        .await
+        .with_context(|| format!("failed to write {}", destination.display()))?;
+
+    set_capture_detail(
+        &mut capture.details,
+        "local_artifact",
+        &json!({
+            "path": relative_path.to_string_lossy(),
+            "filename": artifact.filename,
+        }),
+    );
+
+    Ok(())
+}
+
 fn extract_pypi_dependencies(raw: &Value) -> Vec<String> {
     raw.pointer("/info/requires_dist")
         .and_then(Value::as_array)
@@ -1223,6 +1974,236 @@ fn extract_npm_dependencies(version_meta: &Value) -> Vec<String> {
         .flatten()
         .map(|(name, _)| normalize_package_name(Ecosystem::Npm, name))
         .collect()
+}
+
+fn build_npm_capture_details(package: &str, version_meta: &Value) -> Value {
+    let dependencies = extract_npm_dependencies(version_meta);
+    let install_scripts_benign = npm_install_scripts_benign(version_meta);
+    let metadata_risk = assess_npm_metadata_risk(
+        package,
+        &dependencies,
+        version_meta.get("bin"),
+        version_meta.get("main"),
+        version_meta.pointer("/pkg/targets"),
+    );
+
+    json!({
+        "dist_tags": Value::Null,
+        "maintainers": Value::Null,
+        "publisher": version_meta.get("_npmUser"),
+        "repository": version_meta.get("repository"),
+        "dependencies": dependencies,
+        "deprecated": version_meta.get("deprecated"),
+        "scripts": version_meta.get("scripts"),
+        "has_install_scripts": has_npm_install_script(version_meta),
+        "install_scripts_longstanding": false,
+        "install_scripts_benign": install_scripts_benign,
+        "unpublished": Value::Null,
+        "bin": version_meta.get("bin"),
+        "main": version_meta.get("main"),
+        "pkg_targets": version_meta.pointer("/pkg/targets"),
+        "metadata_risk": metadata_risk
+    })
+}
+
+fn npm_metadata_risk_from_details(package: &str, details: &Value) -> MetadataRiskSignal {
+    let dependencies = details
+        .get("dependencies")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    assess_npm_metadata_risk(
+        package,
+        &dependencies,
+        details.get("bin"),
+        details.get("main"),
+        details.get("pkg_targets"),
+    )
+}
+
+fn assess_npm_metadata_risk(
+    package: &str,
+    dependencies: &[String],
+    bin: Option<&Value>,
+    main: Option<&Value>,
+    pkg_targets: Option<&Value>,
+) -> MetadataRiskSignal {
+    let dependency_set = dependencies
+        .iter()
+        .map(|dependency| dependency.as_str())
+        .collect::<std::collections::HashSet<_>>();
+
+    let native_credential_hits = matching_dependencies(
+        &dependency_set,
+        &[
+            "@primno/dpapi",
+            "node-dpapi",
+            "koffi",
+            "ffi-napi",
+            "ref-napi",
+        ],
+    );
+    let browser_data_hits =
+        matching_dependencies(&dependency_set, &["sqlite3", "better-sqlite3", "level"]);
+    let screen_capture_hits =
+        matching_dependencies(&dependency_set, &["screenshot-desktop", "node-webcam"]);
+    let windows_tooling_hits = matching_dependencies(
+        &dependency_set,
+        &["rcedit", "resedit", "node-windows", "winreg"],
+    );
+    let archive_hits = matching_dependencies(&dependency_set, &["archiver", "adm-zip", "tar"]);
+    let c2_hits = matching_dependencies(&dependency_set, &["ws", "socket.io-client"]);
+
+    let windows_pkg_target = pkg_targets
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|target| target.to_ascii_lowercase().contains("win"));
+    let has_bin_entrypoint = match bin {
+        Some(Value::String(_)) => true,
+        Some(Value::Object(object)) => !object.is_empty(),
+        _ => false,
+    };
+    let main_is_plain_js = main
+        .and_then(Value::as_str)
+        .is_some_and(|entrypoint| entrypoint.ends_with(".js"));
+    let executable_cli_shape = has_bin_entrypoint && main_is_plain_js;
+    let confusable_core = confusable_npm_package_core(package);
+
+    let mut score = 0u32;
+    let mut factors = Vec::new();
+
+    if !native_credential_hits.is_empty() {
+        score += 5;
+        factors.push("native_credential_access_dependency".to_string());
+    }
+    if !browser_data_hits.is_empty() {
+        score += 2;
+        factors.push("browser_data_store_dependency".to_string());
+    }
+    if !screen_capture_hits.is_empty() {
+        score += 2;
+        factors.push("screen_capture_dependency".to_string());
+    }
+    if !windows_tooling_hits.is_empty() {
+        score += 2;
+        factors.push("windows_binary_tooling_dependency".to_string());
+    }
+    if !archive_hits.is_empty() {
+        score += 1;
+        factors.push("archive_exfiltration_dependency".to_string());
+    }
+    if !c2_hits.is_empty() {
+        score += 1;
+        factors.push("realtime_c2_dependency".to_string());
+    }
+    if windows_pkg_target {
+        score += 1;
+        factors.push("windows_binary_target".to_string());
+    }
+    if executable_cli_shape {
+        score += 1;
+        factors.push("bin_executes_javascript_entrypoint".to_string());
+    }
+    if confusable_core {
+        score += 2;
+        factors.push("confusable_package_name".to_string());
+    }
+    if !native_credential_hits.is_empty()
+        && (!browser_data_hits.is_empty()
+            || !screen_capture_hits.is_empty()
+            || !windows_tooling_hits.is_empty())
+    {
+        score += 2;
+        factors.push("credential_theft_capability_combo".to_string());
+    }
+
+    let suspicious = score >= 6;
+    let reason = if suspicious {
+        format!(
+            "npm metadata for {package} combines high-risk native credential, surveillance, or exfiltration dependencies"
+        )
+    } else {
+        "no malware-shaped npm metadata pattern observed".to_string()
+    };
+
+    MetadataRiskSignal {
+        suspicious,
+        score,
+        factors,
+        reason,
+    }
+}
+
+fn matching_dependencies(
+    dependency_set: &std::collections::HashSet<&str>,
+    candidates: &[&'static str],
+) -> Vec<String> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|candidate| dependency_set.contains(candidate))
+        .map(str::to_string)
+        .collect()
+}
+
+fn confusable_npm_package_core(package: &str) -> bool {
+    let unscoped = package.rsplit('/').next().unwrap_or(package);
+    let core = unscoped
+        .split(['-', '_', '.'])
+        .next()
+        .unwrap_or(unscoped)
+        .to_ascii_lowercase();
+    if core.len() < 5 {
+        return false;
+    }
+
+    [
+        "undici",
+        "axios",
+        "react",
+        "lodash",
+        "express",
+        "chalk",
+        "minimatch",
+        "request",
+    ]
+    .iter()
+    .any(|candidate| core != *candidate && levenshtein_distance(&core, candidate) <= 1)
+}
+
+fn levenshtein_distance(left: &str, right: &str) -> usize {
+    if left == right {
+        return 0;
+    }
+    if left.is_empty() {
+        return right.chars().count();
+    }
+    if right.is_empty() {
+        return left.chars().count();
+    }
+
+    let right_chars = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right_chars.len() + 1];
+
+    for (left_index, left_char) in left.chars().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_char) in right_chars.iter().enumerate() {
+            let cost = usize::from(left_char != *right_char);
+            current[right_index + 1] = (current[right_index] + 1)
+                .min(previous[right_index + 1] + 1)
+                .min(previous[right_index] + cost);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[right_chars.len()]
 }
 
 fn parse_pypi_requirement_name(requirement: &str) -> Option<String> {
@@ -1362,6 +2343,29 @@ fn repository_signal_assessment(
     (severity, factors)
 }
 
+fn captured_dependency_names(capture: &CapturedRelease) -> Vec<String> {
+    capture
+        .details
+        .get("dependencies")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|dependency| normalize_package_name(capture.ecosystem, dependency))
+        .collect()
+}
+
+fn previous_captured_release_from_history<'a>(
+    entries: &'a [history::HistoryEntry],
+    target_version: &str,
+) -> Option<&'a CapturedRelease> {
+    entries
+        .iter()
+        .rev()
+        .find(|entry| entry.event.version != target_version && entry.capture.is_some())
+        .and_then(|entry| entry.capture.as_ref())
+}
+
 fn is_prerelease_version(version: &str) -> bool {
     let lower = version.to_ascii_lowercase();
     if ["nightly", "alpha", "beta", "rc", "dev", "canary", "preview"]
@@ -1378,7 +2382,7 @@ fn is_prerelease_version(version: &str) -> bool {
     lower.chars().any(|ch| !(ch.is_ascii_digit() || ch == '.'))
 }
 
-fn capture_has_install_time_execution(capture: &CapturedRelease) -> bool {
+pub(crate) fn capture_has_install_time_execution(capture: &CapturedRelease) -> bool {
     capture
         .details
         .get("has_install_scripts")
@@ -1386,7 +2390,7 @@ fn capture_has_install_time_execution(capture: &CapturedRelease) -> bool {
         .unwrap_or(false)
 }
 
-fn capture_has_longstanding_install_time_execution(capture: &CapturedRelease) -> bool {
+pub(crate) fn capture_has_longstanding_install_time_execution(capture: &CapturedRelease) -> bool {
     capture
         .details
         .get("install_scripts_longstanding")
@@ -1394,12 +2398,195 @@ fn capture_has_longstanding_install_time_execution(capture: &CapturedRelease) ->
         .unwrap_or(false)
 }
 
-fn capture_has_benign_install_time_execution(capture: &CapturedRelease) -> bool {
+pub(crate) fn capture_has_benign_install_time_execution(capture: &CapturedRelease) -> bool {
     capture
         .details
         .get("install_scripts_benign")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+fn should_retain_captured_release(capture: &CapturedRelease) -> bool {
+    if matches!(
+        capture.status,
+        ReleaseStatus::Removed | ReleaseStatus::Yanked
+    ) {
+        return true;
+    }
+
+    if captured_metadata_risk(capture).suspicious || captured_content_risk(capture).suspicious {
+        return true;
+    }
+
+    if capture
+        .upstream_repository
+        .as_ref()
+        .is_some_and(|repository| repository.suspicious)
+    {
+        return true;
+    }
+
+    let risky_install_time_execution = capture_has_install_time_execution(capture)
+        && !capture_has_longstanding_install_time_execution(capture)
+        && !capture_has_benign_install_time_execution(capture);
+    if risky_install_time_execution {
+        return true;
+    }
+
+    false
+}
+
+async fn remove_capture_dir(capture_dir: &Path) {
+    match tokio::fs::remove_dir_all(capture_dir).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            warn!(path = %capture_dir.display(), error = %error, "failed to remove discarded capture dir")
+        }
+    }
+}
+
+async fn promote_capture_dir(staging_dir: &Path, final_dir: &Path) -> Result<()> {
+    if let Some(parent) = final_dir.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create capture dir {}", parent.display()))?;
+    }
+    remove_capture_dir(final_dir).await;
+    tokio::fs::rename(staging_dir, final_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to promote staged capture {} to {}",
+                staging_dir.display(),
+                final_dir.display()
+            )
+        })?;
+    Ok(())
+}
+
+async fn prune_staging_cache(config: &CaptureConfig, perf: &RuntimeStats) -> Result<()> {
+    let staging_dir = config.staging_dir.clone();
+    let ttl = config.staging_cache_ttl;
+    let max_bytes = config.staging_cache_max_bytes;
+    let stats = tokio::task::spawn_blocking(move || {
+        prune_staging_cache_blocking(&staging_dir, ttl, max_bytes)
+    })
+    .await
+    .context("staging cache prune task join failed")??;
+    perf.record_staging_cache_snapshot(stats.entries, stats.bytes);
+    perf.record_staging_cache_pruned(stats.pruned_dirs);
+    Ok(())
+}
+
+fn prune_staging_cache_blocking(
+    staging_dir: &Path,
+    ttl: Duration,
+    max_bytes: u64,
+) -> Result<StagingCacheStats> {
+    if !staging_dir.exists() {
+        return Ok(StagingCacheStats::default());
+    }
+
+    let now = std::time::SystemTime::now();
+    let mut retained = Vec::new();
+    let mut total_bytes = 0u64;
+    let mut pruned_dirs = 0usize;
+
+    for entry in std::fs::read_dir(staging_dir)
+        .with_context(|| format!("failed to read staging dir {}", staging_dir.display()))?
+    {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to read entry under staging dir {}",
+                staging_dir.display()
+            )
+        })?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to stat staging path {}", path.display()))?;
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        let modified_at = metadata
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let bytes = staging_dir_bytes(&path)?;
+        if ttl > Duration::ZERO && now.duration_since(modified_at).unwrap_or(Duration::ZERO) >= ttl
+        {
+            std::fs::remove_dir_all(&path).with_context(|| {
+                format!("failed to remove expired staging dir {}", path.display())
+            })?;
+            pruned_dirs += 1;
+            continue;
+        }
+
+        total_bytes = total_bytes.saturating_add(bytes);
+        retained.push(StagingCacheEntry {
+            path,
+            modified_at,
+            bytes,
+        });
+    }
+
+    if max_bytes == 0 || total_bytes <= max_bytes {
+        return Ok(StagingCacheStats {
+            entries: retained.len(),
+            bytes: total_bytes,
+            pruned_dirs,
+        });
+    }
+
+    retained.sort_by_key(|entry| entry.modified_at);
+    for entry in &retained {
+        if total_bytes <= max_bytes {
+            break;
+        }
+        std::fs::remove_dir_all(&entry.path).with_context(|| {
+            format!(
+                "failed to evict staging dir {} to satisfy cache cap",
+                entry.path.display()
+            )
+        })?;
+        total_bytes = total_bytes.saturating_sub(entry.bytes);
+        pruned_dirs += 1;
+    }
+
+    Ok(StagingCacheStats {
+        entries: retained
+            .into_iter()
+            .filter(|entry| entry.path.exists())
+            .count(),
+        bytes: total_bytes,
+        pruned_dirs,
+    })
+}
+
+fn staging_dir_bytes(path: &Path) -> Result<u64> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat staging path {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Ok(0);
+    }
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(path)
+        .with_context(|| format!("failed to read staging dir {}", path.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read staging entry {}", path.display()))?;
+        total = total.saturating_add(staging_dir_bytes(&entry.path())?);
+    }
+    Ok(total)
 }
 
 async fn fetch_json_metadata(
@@ -1508,6 +2695,14 @@ fn summarize_body_preview(bytes: &[u8]) -> String {
     }
 }
 
+fn npm_version_metadata_url(packument_url: &str, version: &str) -> String {
+    format!(
+        "{}/{}",
+        packument_url.trim_end_matches('/'),
+        urlencoding::encode(version)
+    )
+}
+
 fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
@@ -1543,7 +2738,9 @@ mod tests {
     };
     use async_trait::async_trait;
     use chrono::TimeZone;
+    use flate2::{Compression, write::GzEncoder};
     use std::sync::Arc;
+    use tar::Builder as TarBuilder;
     use tempfile::tempdir;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1651,6 +2848,48 @@ mod tests {
     }
 
     #[test]
+    fn detects_lofygang_style_npm_metadata_risk() {
+        let details = build_npm_capture_details(
+            "undicy-http",
+            &json!({
+                "main": "index.js",
+                "bin": "index.js",
+                "pkg": {"targets": ["node20-win-x64"]},
+                "dependencies": {
+                    "@primno/dpapi": "^2.0.1",
+                    "adm-zip": "^0.5.16",
+                    "archiver": "^7.0.1",
+                    "koffi": "^2.15.2",
+                    "rcedit": "^4.0.1",
+                    "screenshot-desktop": "^1.15.3",
+                    "sqlite3": "^5.1.7",
+                    "ws": "^8.18.2"
+                }
+            }),
+        );
+
+        let signal = serde_json::from_value::<MetadataRiskSignal>(
+            details.get("metadata_risk").cloned().unwrap(),
+        )
+        .unwrap();
+
+        assert!(signal.suspicious);
+        assert!(signal.score >= 8);
+        assert!(
+            signal
+                .factors
+                .iter()
+                .any(|factor| factor == "confusable_package_name")
+        );
+        assert!(
+            signal
+                .factors
+                .iter()
+                .any(|factor| factor == "credential_theft_capability_combo")
+        );
+    }
+
+    #[test]
     fn extracts_crates_checksum_and_yank_state() {
         let version_meta = json!({
             "num": "1.0.0",
@@ -1730,6 +2969,7 @@ mod tests {
             candidate_refs: vec!["1.0.0-nightly.1".to_string()],
             match_kind: repo_provenance::RepositoryMatchKind::None,
             matched_ref: None,
+            matched_commit: None,
             suspicious: true,
             reason: "repository resolved on GitHub but no matching tag or release was found for the package version".to_string(),
         };
@@ -1793,6 +3033,7 @@ mod tests {
             candidate_refs: vec!["1.0.0".to_string()],
             match_kind: repo_provenance::RepositoryMatchKind::None,
             matched_ref: None,
+            matched_commit: None,
             suspicious: true,
             reason: "repository resolved on GitHub but no matching tag or release was found for the package version".to_string(),
         };
@@ -1859,6 +3100,7 @@ mod tests {
             candidate_refs: vec!["1.0.0".to_string(), "v1.0.0".to_string()],
             match_kind: repo_provenance::RepositoryMatchKind::None,
             matched_ref: None,
+            matched_commit: None,
             suspicious: true,
             reason: "repository resolved on GitHub but no matching tag or release was found for the package version".to_string(),
         };
@@ -1925,6 +3167,7 @@ mod tests {
             candidate_refs: vec!["1.0.0".to_string(), "v1.0.0".to_string()],
             match_kind: repo_provenance::RepositoryMatchKind::None,
             matched_ref: None,
+            matched_commit: None,
             suspicious: true,
             reason: "repository resolved on GitHub but no matching tag or release was found for the package version".to_string(),
         };
@@ -1938,6 +3181,242 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn diff_escalation_reason_escalates_stable_repo_mismatch_on_impacted_package() {
+        let temp_dir = tempdir().unwrap();
+        let data_dir = temp_dir.path().join("data");
+        let store = store::OperationalStore::open(store::index_db_path(&data_dir))
+            .await
+            .unwrap();
+        let context = CaptureContext {
+            http: reqwest::Client::builder().build().unwrap(),
+            config: CaptureConfig {
+                queue_capacity: 1,
+                worker_concurrency: 1,
+                data_dir: data_dir.clone(),
+                observed_event_log_path: ledger::observed_ledger_path(&data_dir),
+                capture_dir: data_dir.join("captures"),
+                staging_dir: data_dir.join("staging-captures"),
+                staging_cache_ttl: Duration::from_secs(60),
+                staging_cache_max_bytes: 1024 * 1024,
+                staging_cache_sweep_interval: Duration::from_secs(1),
+                graph_file: data_dir.join("graph-input.ndjson"),
+                pypi_provenance: false,
+                github_api_base: "https://api.github.com".to_string(),
+                gitlab_api_base: "https://gitlab.com/api/v4".to_string(),
+            },
+            diff_tx: None,
+            priority: None,
+            sink: None,
+            store,
+            perf: RuntimeStats::default(),
+        };
+
+        let event = PackageReleaseEvent {
+            event_id: "npm:demo@1.0.1".to_string(),
+            ecosystem: Ecosystem::Npm,
+            package: "demo".to_string(),
+            version: "1.0.1".to_string(),
+            published_at: None,
+            observed_at: Utc::now(),
+            source: "test".to_string(),
+            sequence: None,
+            package_url: None,
+            release_url: None,
+            metadata_url: None,
+            priority: Some(PrioritySnapshot {
+                tier: PriorityTier::Medium,
+                source: PrioritySource::KnownPackageStub,
+                direct_popularity: None,
+                propagated_impact: None,
+                hidden_leverage: None,
+                computed_at: None,
+                score_source_version: None,
+            }),
+        };
+        let capture = CapturedRelease {
+            event_id: event.event_id.clone(),
+            ecosystem: event.ecosystem,
+            package: event.package.clone(),
+            version: event.version.clone(),
+            observed_at: event.observed_at,
+            published_at: None,
+            captured_at: Utc::now(),
+            status: ReleaseStatus::Active,
+            package_url: None,
+            release_url: None,
+            metadata_url: None,
+            raw_metadata_path: None,
+            artifacts: Vec::new(),
+            upstream_repository: Some(RepositoryReleaseProvenance {
+                provider: repo_provenance::RepositoryProvider::Github,
+                repository_url: "https://github.com/example/demo".to_string(),
+                normalized_repository_url: "https://github.com/example/demo".to_string(),
+                package_version: event.version.clone(),
+                checked_at: Utc::now(),
+                candidate_refs: vec!["1.0.1".to_string()],
+                match_kind: repo_provenance::RepositoryMatchKind::None,
+                matched_ref: None,
+                matched_commit: None,
+                suspicious: true,
+                reason: "repository resolved on GitHub but no matching tag or release was found for the package version".to_string(),
+            }),
+            details: json!({ "dependencies": ["dep-a"] }),
+        };
+
+        let reason = context
+            .diff_escalation_reason(&event, &capture)
+            .await
+            .unwrap();
+        assert_eq!(
+            reason.as_deref(),
+            Some("post-capture diff escalation: stable upstream mismatch on impacted package")
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_escalation_reason_uses_previous_release_dependencies() {
+        let temp_dir = tempdir().unwrap();
+        let data_dir = temp_dir.path().join("data");
+        let store = store::OperationalStore::open(store::index_db_path(&data_dir))
+            .await
+            .unwrap();
+        let context = CaptureContext {
+            http: reqwest::Client::builder().build().unwrap(),
+            config: CaptureConfig {
+                queue_capacity: 1,
+                worker_concurrency: 1,
+                data_dir: data_dir.clone(),
+                observed_event_log_path: ledger::observed_ledger_path(&data_dir),
+                capture_dir: data_dir.join("captures"),
+                staging_dir: data_dir.join("staging-captures"),
+                staging_cache_ttl: Duration::from_secs(60),
+                staging_cache_max_bytes: 1024 * 1024,
+                staging_cache_sweep_interval: Duration::from_secs(1),
+                graph_file: data_dir.join("graph-input.ndjson"),
+                pypi_provenance: false,
+                github_api_base: "https://api.github.com".to_string(),
+                gitlab_api_base: "https://gitlab.com/api/v4".to_string(),
+            },
+            diff_tx: None,
+            priority: None,
+            sink: None,
+            store: store.clone(),
+            perf: RuntimeStats::default(),
+        };
+
+        let previous_event = PackageReleaseEvent {
+            event_id: "npm:demo@1.0.0".to_string(),
+            ecosystem: Ecosystem::Npm,
+            package: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            published_at: None,
+            observed_at: Utc::now(),
+            source: "test".to_string(),
+            sequence: None,
+            package_url: None,
+            release_url: None,
+            metadata_url: None,
+            priority: Some(PrioritySnapshot {
+                tier: PriorityTier::Medium,
+                source: PrioritySource::KnownPackageStub,
+                direct_popularity: None,
+                propagated_impact: None,
+                hidden_leverage: None,
+                computed_at: None,
+                score_source_version: None,
+            }),
+        };
+        let previous_capture = CapturedRelease {
+            event_id: previous_event.event_id.clone(),
+            ecosystem: previous_event.ecosystem,
+            package: previous_event.package.clone(),
+            version: previous_event.version.clone(),
+            observed_at: previous_event.observed_at,
+            published_at: None,
+            captured_at: Utc::now(),
+            status: ReleaseStatus::Active,
+            package_url: None,
+            release_url: None,
+            metadata_url: None,
+            raw_metadata_path: None,
+            artifacts: Vec::new(),
+            upstream_repository: None,
+            details: json!({ "dependencies": ["dep-a"] }),
+        };
+        let previous_capture_dir = history::capture_dir_for_event(&data_dir, &previous_event);
+        tokio::fs::create_dir_all(&previous_capture_dir)
+            .await
+            .unwrap();
+        write_json_pretty(
+            &previous_capture_dir.join("capture.json"),
+            &previous_capture,
+        )
+        .await
+        .unwrap();
+        store
+            .record_event(&previous_event, EventOrigin::Observed)
+            .await
+            .unwrap();
+        store
+            .record_capture(
+                &previous_event,
+                EventOrigin::Observed,
+                &previous_capture_dir,
+                &previous_capture,
+            )
+            .await
+            .unwrap();
+
+        let current_event = PackageReleaseEvent {
+            event_id: "npm:demo@1.0.1".to_string(),
+            ecosystem: Ecosystem::Npm,
+            package: "demo".to_string(),
+            version: "1.0.1".to_string(),
+            published_at: None,
+            observed_at: Utc::now(),
+            source: "test".to_string(),
+            sequence: None,
+            package_url: None,
+            release_url: None,
+            metadata_url: None,
+            priority: Some(PrioritySnapshot {
+                tier: PriorityTier::Medium,
+                source: PrioritySource::KnownPackageStub,
+                direct_popularity: None,
+                propagated_impact: None,
+                hidden_leverage: None,
+                computed_at: None,
+                score_source_version: None,
+            }),
+        };
+        let current_capture = CapturedRelease {
+            event_id: current_event.event_id.clone(),
+            ecosystem: current_event.ecosystem,
+            package: current_event.package.clone(),
+            version: current_event.version.clone(),
+            observed_at: current_event.observed_at,
+            published_at: None,
+            captured_at: Utc::now(),
+            status: ReleaseStatus::Active,
+            package_url: None,
+            release_url: None,
+            metadata_url: None,
+            raw_metadata_path: None,
+            artifacts: Vec::new(),
+            upstream_repository: None,
+            details: json!({ "dependencies": ["dep-a", "plain-crypto-js"] }),
+        };
+
+        let reason = context
+            .diff_escalation_reason(&current_event, &current_capture)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reason.contains("introduced new dependencies"));
+        assert!(reason.contains("plain-crypto-js"));
+    }
+
     #[test]
     fn summarize_body_preview_compacts_and_truncates() {
         let preview = summarize_body_preview(
@@ -1947,6 +3426,16 @@ mod tests {
             preview.contains("\"error\": \"upstream exploded badly and kept talking for a while\"")
         );
         assert!(!preview.contains('\n'));
+    }
+
+    #[test]
+    fn npm_version_metadata_url_appends_encoded_version() {
+        let url =
+            npm_version_metadata_url("https://registry.npmjs.org/%40scope%2Fdemo", "1.2.3-beta.1");
+        assert_eq!(
+            url,
+            "https://registry.npmjs.org/%40scope%2Fdemo/1.2.3-beta.1"
+        );
     }
 
     #[tokio::test]
@@ -2011,6 +3500,10 @@ mod tests {
                 data_dir: data_dir.clone(),
                 observed_event_log_path: ledger_path,
                 capture_dir: capture_dir.clone(),
+                staging_dir: data_dir.join("staging-captures"),
+                staging_cache_ttl: Duration::from_secs(60),
+                staging_cache_max_bytes: 1024 * 1024,
+                staging_cache_sweep_interval: Duration::from_secs(1),
                 graph_file: data_dir.join("graph-input.ndjson"),
                 pypi_provenance: false,
                 github_api_base: "https://api.github.com".to_string(),
@@ -2129,6 +3622,10 @@ mod tests {
                 data_dir: data_dir.clone(),
                 observed_event_log_path: ledger_path,
                 capture_dir,
+                staging_dir: data_dir.join("staging-captures"),
+                staging_cache_ttl: Duration::from_secs(60),
+                staging_cache_max_bytes: 1024 * 1024,
+                staging_cache_sweep_interval: Duration::from_secs(1),
                 graph_file: graph_file.clone(),
                 pypi_provenance: false,
                 github_api_base: "https://api.github.com".to_string(),
@@ -2284,6 +3781,10 @@ mod tests {
                 data_dir: data_dir.clone(),
                 observed_event_log_path: ledger_path,
                 capture_dir,
+                staging_dir: data_dir.join("staging-captures"),
+                staging_cache_ttl: Duration::from_secs(60),
+                staging_cache_max_bytes: 1024 * 1024,
+                staging_cache_sweep_interval: Duration::from_secs(1),
                 graph_file,
                 pypi_provenance: false,
                 github_api_base: "https://api.github.com".to_string(),
@@ -2445,6 +3946,10 @@ mod tests {
                 data_dir: data_dir.clone(),
                 observed_event_log_path: ledger_path,
                 capture_dir,
+                staging_dir: data_dir.join("staging-captures"),
+                staging_cache_ttl: Duration::from_secs(60),
+                staging_cache_max_bytes: 1024 * 1024,
+                staging_cache_sweep_interval: Duration::from_secs(1),
                 graph_file,
                 pypi_provenance: false,
                 github_api_base: "https://api.github.com".to_string(),
@@ -2529,6 +4034,10 @@ mod tests {
                 data_dir: data_dir.clone(),
                 observed_event_log_path: ledger::observed_ledger_path(&data_dir),
                 capture_dir: data_dir.join("captures"),
+                staging_dir: data_dir.join("staging-captures"),
+                staging_cache_ttl: Duration::from_secs(60),
+                staging_cache_max_bytes: 1024 * 1024,
+                staging_cache_sweep_interval: Duration::from_secs(1),
                 graph_file: data_dir.join("graph-input.ndjson"),
                 pypi_provenance: false,
                 github_api_base: "https://api.github.com".to_string(),
@@ -2557,6 +4066,389 @@ mod tests {
         assert_eq!(stats.capture_states.skipped, 1);
         assert_eq!(stats.diff_states.skipped, 1);
         assert_eq!(stats.priorities.low, 1);
+    }
+
+    #[tokio::test]
+    async fn triaged_post_process_discards_low_signal_capture_from_staging() {
+        let temp_dir = tempdir().unwrap();
+        let data_dir = temp_dir.path().join("data");
+        let store = store::OperationalStore::open(store::index_db_path(&data_dir))
+            .await
+            .unwrap();
+        let context = CaptureContext {
+            http: reqwest::Client::builder().build().unwrap(),
+            config: CaptureConfig {
+                queue_capacity: 1,
+                worker_concurrency: 1,
+                data_dir: data_dir.clone(),
+                observed_event_log_path: ledger::observed_ledger_path(&data_dir),
+                capture_dir: data_dir.join("captures"),
+                staging_dir: data_dir.join("staging-captures"),
+                staging_cache_ttl: Duration::from_secs(60),
+                staging_cache_max_bytes: 1024 * 1024,
+                staging_cache_sweep_interval: Duration::from_secs(1),
+                graph_file: data_dir.join("graph-input.ndjson"),
+                pypi_provenance: false,
+                github_api_base: "https://api.github.com".to_string(),
+                gitlab_api_base: "https://gitlab.com/api/v4".to_string(),
+            },
+            diff_tx: None,
+            priority: None,
+            sink: None,
+            store: store.clone(),
+            perf: RuntimeStats::default(),
+        };
+
+        let event = PackageReleaseEvent {
+            event_id: "pypi:demo@2.0.0".to_string(),
+            ecosystem: Ecosystem::Pypi,
+            package: "demo".to_string(),
+            version: "2.0.0".to_string(),
+            published_at: None,
+            observed_at: Utc::now(),
+            source: "test".to_string(),
+            sequence: None,
+            package_url: None,
+            release_url: None,
+            metadata_url: None,
+            priority: Some(PrioritySnapshot::known_package_stub()),
+        };
+        store
+            .record_event(&event, EventOrigin::Observed)
+            .await
+            .unwrap();
+
+        let staging_dir = data_dir
+            .join("staging-captures")
+            .join(urlencoding::encode(&event.event_id).into_owned());
+        tokio::fs::create_dir_all(&staging_dir).await.unwrap();
+        let capture = CapturedRelease {
+            event_id: event.event_id.clone(),
+            ecosystem: event.ecosystem,
+            package: event.package.clone(),
+            version: event.version.clone(),
+            observed_at: event.observed_at,
+            published_at: event.published_at,
+            captured_at: Utc::now(),
+            status: ReleaseStatus::Active,
+            package_url: None,
+            release_url: None,
+            metadata_url: None,
+            raw_metadata_path: None,
+            artifacts: Vec::new(),
+            upstream_repository: None,
+            details: json!({
+                "dependencies": [],
+                "has_install_scripts": false,
+                "metadata_risk": {
+                    "suspicious": false,
+                    "score": 0,
+                    "factors": [],
+                    "reason": "clean"
+                }
+            }),
+        };
+        write_json_pretty(&staging_dir.join("capture.json"), &capture)
+            .await
+            .unwrap();
+
+        context
+            .post_process_capture(PostCaptureRequest {
+                event: event.clone(),
+                origin: EventOrigin::Observed,
+                notify_diff: false,
+                retention: CaptureRetention::Ephemeral,
+                capture_dir: staging_dir.clone(),
+                final_capture_dir: context.capture_path_for_event(&event),
+                capture,
+            })
+            .await
+            .unwrap();
+
+        assert!(!staging_dir.exists());
+        assert!(!context.capture_path_for_event(&event).exists());
+        let record = store
+            .load_release_record(&event.event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.capture_state, "skipped");
+        assert_eq!(
+            record.capture_reason.as_deref(),
+            Some("post-analysis dropped low-signal triaged capture")
+        );
+    }
+
+    #[tokio::test]
+    async fn triaged_post_process_promotes_suspicious_capture_from_staging() {
+        let temp_dir = tempdir().unwrap();
+        let data_dir = temp_dir.path().join("data");
+        let store = store::OperationalStore::open(store::index_db_path(&data_dir))
+            .await
+            .unwrap();
+        let context = CaptureContext {
+            http: reqwest::Client::builder().build().unwrap(),
+            config: CaptureConfig {
+                queue_capacity: 1,
+                worker_concurrency: 1,
+                data_dir: data_dir.clone(),
+                observed_event_log_path: ledger::observed_ledger_path(&data_dir),
+                capture_dir: data_dir.join("captures"),
+                staging_dir: data_dir.join("staging-captures"),
+                staging_cache_ttl: Duration::from_secs(60),
+                staging_cache_max_bytes: 1024 * 1024,
+                staging_cache_sweep_interval: Duration::from_secs(1),
+                graph_file: data_dir.join("graph-input.ndjson"),
+                pypi_provenance: false,
+                github_api_base: "https://api.github.com".to_string(),
+                gitlab_api_base: "https://gitlab.com/api/v4".to_string(),
+            },
+            diff_tx: None,
+            priority: None,
+            sink: None,
+            store: store.clone(),
+            perf: RuntimeStats::default(),
+        };
+
+        let event = PackageReleaseEvent {
+            event_id: "pypi:demo@2.0.1".to_string(),
+            ecosystem: Ecosystem::Pypi,
+            package: "demo".to_string(),
+            version: "2.0.1".to_string(),
+            published_at: None,
+            observed_at: Utc::now(),
+            source: "test".to_string(),
+            sequence: None,
+            package_url: None,
+            release_url: None,
+            metadata_url: None,
+            priority: Some(PrioritySnapshot::known_package_stub()),
+        };
+        store
+            .record_event(&event, EventOrigin::Observed)
+            .await
+            .unwrap();
+
+        let staging_dir = data_dir
+            .join("staging-captures")
+            .join(urlencoding::encode(&event.event_id).into_owned());
+        tokio::fs::create_dir_all(&staging_dir).await.unwrap();
+        let capture = CapturedRelease {
+            event_id: event.event_id.clone(),
+            ecosystem: event.ecosystem,
+            package: event.package.clone(),
+            version: event.version.clone(),
+            observed_at: event.observed_at,
+            published_at: event.published_at,
+            captured_at: Utc::now(),
+            status: ReleaseStatus::Active,
+            package_url: None,
+            release_url: None,
+            metadata_url: None,
+            raw_metadata_path: None,
+            artifacts: Vec::new(),
+            upstream_repository: None,
+            details: json!({
+                "dependencies": [],
+                "has_install_scripts": false,
+                "metadata_risk": {
+                    "suspicious": true,
+                    "score": 8,
+                    "factors": ["test_factor"],
+                    "reason": "test suspicious metadata"
+                }
+            }),
+        };
+        write_json_pretty(&staging_dir.join("capture.json"), &capture)
+            .await
+            .unwrap();
+
+        let final_capture_dir = context.capture_path_for_event(&event);
+        context
+            .post_process_capture(PostCaptureRequest {
+                event: event.clone(),
+                origin: EventOrigin::Observed,
+                notify_diff: false,
+                retention: CaptureRetention::Ephemeral,
+                capture_dir: staging_dir.clone(),
+                final_capture_dir: final_capture_dir.clone(),
+                capture,
+            })
+            .await
+            .unwrap();
+
+        assert!(!staging_dir.exists());
+        assert!(final_capture_dir.join("capture.json").exists());
+        let record = store
+            .load_release_record(&event.event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.capture_state, "ready");
+    }
+
+    #[tokio::test]
+    async fn staging_cache_prune_enforces_ttl_and_size_cap() {
+        let temp_dir = tempdir().unwrap();
+        let data_dir = temp_dir.path().join("data");
+        let staging_dir = data_dir.join("staging-captures");
+        tokio::fs::create_dir_all(&staging_dir).await.unwrap();
+
+        let expired_dir = staging_dir.join("expired");
+        tokio::fs::create_dir_all(&expired_dir).await.unwrap();
+        tokio::fs::write(expired_dir.join("capture.json"), b"{}")
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(25)).await;
+
+        let older_dir = staging_dir.join("older");
+        tokio::fs::create_dir_all(&older_dir).await.unwrap();
+        tokio::fs::write(older_dir.join("artifact.bin"), vec![0u8; 1024])
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(25)).await;
+
+        let newer_dir = staging_dir.join("newer");
+        tokio::fs::create_dir_all(&newer_dir).await.unwrap();
+        tokio::fs::write(newer_dir.join("artifact.bin"), vec![0u8; 1024])
+            .await
+            .unwrap();
+
+        let config = CaptureConfig {
+            queue_capacity: 1,
+            worker_concurrency: 1,
+            data_dir: data_dir.clone(),
+            observed_event_log_path: ledger::observed_ledger_path(&data_dir),
+            capture_dir: data_dir.join("captures"),
+            staging_dir: staging_dir.clone(),
+            staging_cache_ttl: Duration::from_millis(10),
+            staging_cache_max_bytes: 1024,
+            staging_cache_sweep_interval: Duration::from_secs(1),
+            graph_file: data_dir.join("graph-input.ndjson"),
+            pypi_provenance: false,
+            github_api_base: "https://api.github.com".to_string(),
+            gitlab_api_base: "https://gitlab.com/api/v4".to_string(),
+        };
+
+        prune_staging_cache(&config, &RuntimeStats::default())
+            .await
+            .unwrap();
+
+        assert!(!expired_dir.exists());
+        assert!(!older_dir.exists());
+        assert!(newer_dir.exists());
+    }
+
+    async fn serve_bytes_once(content_type: &str, body: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let content_type = content_type.to_string();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+
+        format!("http://{addr}/artifact.bin")
+    }
+
+    fn write_test_npm_archive(base: &Path, files: &[(&str, &str)]) -> String {
+        let source_root = base.join("archive-source");
+        std::fs::create_dir_all(&source_root).unwrap();
+        for (relative, content) in files {
+            let path = source_root.join("package").join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, content).unwrap();
+        }
+
+        let archive_path = base.join("package.tgz");
+        let archive_file = std::fs::File::create(&archive_path).unwrap();
+        let encoder = GzEncoder::new(archive_file, Compression::default());
+        let mut builder = TarBuilder::new(encoder);
+        builder
+            .append_dir_all("package", source_root.join("package"))
+            .unwrap();
+        builder.finish().unwrap();
+        archive_path.to_string_lossy().to_string()
+    }
+
+    #[tokio::test]
+    async fn materializes_primary_artifact_into_capture_dir_and_records_relative_path() {
+        let temp_dir = tempdir().unwrap();
+        let archive_bytes = tokio::fs::read(write_test_npm_archive(
+            temp_dir.path(),
+            &[
+                (
+                    "package.json",
+                    &serde_json::to_string_pretty(&json!({
+                        "name": "demo",
+                        "version": "1.0.0",
+                        "main": "index.js"
+                    }))
+                    .unwrap(),
+                ),
+                ("index.js", "module.exports = 1;"),
+            ],
+        ))
+        .await
+        .unwrap();
+        let artifact_url = serve_bytes_once("application/octet-stream", archive_bytes).await;
+        let capture_dir = temp_dir.path().join("capture");
+        tokio::fs::create_dir_all(&capture_dir).await.unwrap();
+
+        let mut capture = CapturedRelease {
+            event_id: "npm:demo@1.0.0".to_string(),
+            ecosystem: Ecosystem::Npm,
+            package: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            observed_at: Utc::now(),
+            published_at: None,
+            captured_at: Utc::now(),
+            status: ReleaseStatus::Active,
+            package_url: None,
+            release_url: None,
+            metadata_url: None,
+            raw_metadata_path: None,
+            artifacts: Vec::new(),
+            upstream_repository: None,
+            details: json!({}),
+        };
+        capture.artifacts = vec![CapturedArtifact {
+            filename: "demo-1.0.0.tgz".to_string(),
+            kind: Some("npm-tarball".to_string()),
+            url: Some(artifact_url),
+            size_bytes: None,
+            uploaded_at: None,
+            yanked: None,
+            hashes: ArtifactHashes::default(),
+            provenance_path: None,
+        }];
+
+        materialize_primary_artifact_into_capture_dir(
+            &reqwest::Client::new(),
+            &capture_dir,
+            &mut capture,
+        )
+        .await
+        .unwrap();
+
+        let relative = capture
+            .details
+            .pointer("/local_artifact/path")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert_eq!(relative, "artifacts/demo-1.0.0.tgz");
+        assert!(capture_dir.join(relative).exists());
     }
 
     async fn serve_json_once(body: Value) -> String {

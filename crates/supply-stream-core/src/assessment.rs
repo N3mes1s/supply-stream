@@ -867,6 +867,47 @@ mod tests {
     }
 
     #[test]
+    fn assessment_downgrades_lone_webhook_marker_rule_to_suspicious_unknown_warning() {
+        let event = sample_event(PriorityTier::Low, "3.6.0");
+        let mut capture = sample_capture(false);
+        capture.details["content_risk"] = json!({
+            "scanned": true,
+            "suspicious": true,
+            "score": 6,
+            "factors": ["generic_discord_or_telegram_exfil"],
+            "reason": "content embeds a Discord webhook or Telegram bot token for exfiltration",
+            "matches": [{
+                "rule_id": "generic_discord_or_telegram_exfil",
+                "namespace": "default",
+                "tags": ["malware", "exfil"],
+                "score": 6,
+                "file_path": "lib/notify.js",
+                "file_role": "entrypoint",
+                "matched_patterns": ["$discord"],
+                "pattern_matches": [{
+                    "pattern_id": "$discord",
+                    "range_start": 0,
+                    "range_end": 25,
+                    "preview": "discord.com/api/webhooks/"
+                }],
+                "evidence_kind": "pattern",
+                "description": "content embeds a Discord webhook or Telegram bot token for exfiltration"
+            }],
+            "iocs": [],
+            "scanned_files": [],
+            "engine": "yara_x",
+            "rule_set_version": "test"
+        });
+
+        let assessment = assess_release(&event, None, &capture, None, None);
+        assert_eq!(assessment.severity, ReleaseAssessmentSeverity::Warning);
+        assert_eq!(
+            assessment.verdict_class,
+            ReleaseVerdictClass::SuspiciousUnknown
+        );
+    }
+
+    #[test]
     fn assessment_keeps_longstanding_install_script_repo_mismatch_informational() {
         let event = sample_event(PriorityTier::Medium, "1.2.3");
         let mut capture = sample_capture(true);

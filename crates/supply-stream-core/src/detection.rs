@@ -67,7 +67,7 @@ pub fn rule_behavior_profile(rule_id: &str, rule_tags: &[String]) -> RuleBehavio
             || rule_id.contains("build_script_file_read_exfil")
             || rule_id.contains("browser_process_kill_and_theft")
             || rule_id.contains("discord_bot_rat")
-            || rule_id.contains("disco")
+            || rule_id.contains("discord_token_theft")
             || rule_id.contains("keylogger")
             || rule_id.contains("password_manager_theft")
             || rule_id.contains("browser_wallet_extension_theft")

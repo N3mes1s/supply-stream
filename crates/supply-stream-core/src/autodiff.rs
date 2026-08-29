@@ -13,6 +13,7 @@ use crate::{
     event::{EmittedReleaseAssessmentSignal, PackageReleaseEvent},
     history,
     perf::RuntimeStats,
+    repo_provenance,
     sink::EventSink,
     store::{EventOrigin, OperationalStore},
 };
@@ -34,6 +35,7 @@ pub struct DiffWorker {
 #[derive(Debug, Clone)]
 pub struct DiffRequest {
     pub event: PackageReleaseEvent,
+    pub force_reason: Option<String>,
     pub enqueued_at: Instant,
 }
 
@@ -41,6 +43,15 @@ impl DiffRequest {
     pub fn new(event: PackageReleaseEvent) -> Self {
         Self {
             event,
+            force_reason: None,
+            enqueued_at: Instant::now(),
+        }
+    }
+
+    pub fn forced(event: PackageReleaseEvent, reason: impl Into<String>) -> Self {
+        Self {
+            event,
+            force_reason: Some(reason.into()),
             enqueued_at: Instant::now(),
         }
     }
@@ -125,7 +136,7 @@ impl DiffContext {
         let event = &request.event;
         let capture_dir = history::capture_dir_for_event(&self.config.data_dir, event);
         let result: Result<()> = async {
-            if !event.diff_requested() {
+            if !event.diff_requested() && request.force_reason.is_none() {
                 self.store
                     .mark_diff_skipped(&event.event_id, "priority policy skipped diff")
                     .await?;
@@ -192,6 +203,9 @@ impl DiffContext {
                 }
             }
 
+            self.reconcile_crate_commit_provenance(event, &capture_dir, &stored)
+                .await?;
+
             write_json_pretty(&diff_json_path, &stored).await?;
 
             if self.config.write_markdown {
@@ -224,6 +238,57 @@ impl DiffContext {
             }
         }
         result
+    }
+
+    async fn reconcile_crate_commit_provenance(
+        &self,
+        event: &PackageReleaseEvent,
+        capture_dir: &Path,
+        stored: &diff::StoredReleaseDiff,
+    ) -> Result<()> {
+        if event.ecosystem != crate::event::Ecosystem::CratesIo {
+            return Ok(());
+        }
+
+        let Some(target_commit) = stored
+            .diff
+            .as_ref()
+            .and_then(|diff| diff.content.crate_repository_commit.as_ref())
+            .and_then(|evidence| evidence.target_commit.as_deref())
+        else {
+            return Ok(());
+        };
+
+        let capture_path = capture_dir.join("capture.json");
+        let mut capture = load_capture(&capture_path).await?;
+        let Some(repository) = capture.upstream_repository.as_ref() else {
+            return Ok(());
+        };
+        if !repository.suspicious {
+            return Ok(());
+        }
+
+        let Some(provenance) = repo_provenance::check_repository_commit_provenance(
+            &reqwest::Client::new(),
+            &repository.repository_url,
+            &event.version,
+            target_commit,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+
+        if provenance.suspicious {
+            return Ok(());
+        }
+
+        capture.upstream_repository = Some(provenance);
+        write_json_pretty(&capture_path, &capture).await?;
+        self.store
+            .record_capture(event, EventOrigin::Observed, capture_dir, &capture)
+            .await?;
+        Ok(())
     }
 
     async fn emit_release_assessment(
@@ -272,9 +337,13 @@ impl DiffContext {
                 suspicious: assessment.suspicious,
                 signal_type: "repo_graph_diff_fusion",
                 severity: assessment.severity,
+                verdict_class: assessment.verdict_class,
                 priority_tier: event.priority_snapshot().tier,
                 graph: assessment.graph,
                 factors: assessment.factors,
+                behavior_tags: assessment.behavior_tags,
+                matched_rules: assessment.matched_rules,
+                matched_evidence: assessment.matched_evidence,
                 reason: assessment.reason,
                 repository,
                 diff: assessment.diff,
@@ -315,6 +384,9 @@ impl DiffContext {
         let Some(sink) = &self.sink else {
             return;
         };
+        if !bundle::should_publish_live_bundle(&bundle) {
+            return;
+        }
         if let Err(error) = sink.publish_release_bundle(&bundle).await {
             warn!(event_id = event.event_id, error = %error, "failed to publish release bundle");
         }

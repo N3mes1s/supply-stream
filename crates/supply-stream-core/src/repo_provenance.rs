@@ -1,7 +1,8 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     path::Path,
     sync::{LazyLock, Mutex},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -12,20 +13,26 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::process::Command;
 
-use crate::event::Ecosystem;
+use crate::{bounded_map::BoundedMap, event::Ecosystem};
 
 const GITHUB_API_BASE: &str = "https://api.github.com";
 const GITLAB_API_BASE: &str = "https://gitlab.com/api/v4";
 const GITHUB_API_VERSION: &str = "2022-11-28";
 const GITHUB_ACCEPT_HEADER: &str = "application/vnd.github+json";
 const GITHUB_USER_AGENT: &str = "supply-stream";
+const MAX_GITHUB_TAG_CACHE_ENTRIES: usize = 2048;
+const MAX_GITHUB_RELEASE_CACHE_ENTRIES: usize = 8192;
+const MAX_GITLAB_TAG_CACHE_ENTRIES: usize = 2048;
 
-static GITHUB_TAG_CACHE: LazyLock<Mutex<HashMap<String, CachedGithubTags>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-static GITHUB_RELEASE_CACHE: LazyLock<Mutex<HashMap<String, bool>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-static GITLAB_TAG_CACHE: LazyLock<Mutex<HashMap<String, CachedGitlabTag>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static GITHUB_TAG_CACHE: LazyLock<Mutex<BoundedMap<String, CachedGithubTags>>> =
+    LazyLock::new(|| Mutex::new(BoundedMap::new(MAX_GITHUB_TAG_CACHE_ENTRIES)));
+static GITHUB_RELEASE_CACHE: LazyLock<Mutex<BoundedMap<String, bool>>> =
+    LazyLock::new(|| Mutex::new(BoundedMap::new(MAX_GITHUB_RELEASE_CACHE_ENTRIES)));
+static GITLAB_TAG_CACHE: LazyLock<Mutex<BoundedMap<String, CachedGitlabTag>>> =
+    LazyLock::new(|| Mutex::new(BoundedMap::new(MAX_GITLAB_TAG_CACHE_ENTRIES)));
+static GITHUB_BACKOFF: LazyLock<Mutex<Option<GithubBackoff>>> = LazyLock::new(|| Mutex::new(None));
+
+const GITHUB_BACKOFF_DURATION: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone)]
 enum CachedGithubTags {
@@ -39,6 +46,12 @@ enum CachedGitlabTag {
     Match { has_release: bool },
     NotFound,
     Unknown(String),
+}
+
+#[derive(Debug, Clone)]
+struct GithubBackoff {
+    until: Instant,
+    reason: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -84,6 +97,7 @@ impl RepositoryProvider {
 pub enum RepositoryMatchKind {
     Tag,
     Release,
+    Commit,
     None,
     Unknown,
 }
@@ -100,6 +114,8 @@ pub struct RepositoryReleaseProvenance {
     pub match_kind: RepositoryMatchKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matched_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_commit: Option<String>,
     pub suspicious: bool,
     pub reason: String,
 }
@@ -155,6 +171,23 @@ pub async fn check_release_provenance(
         ecosystem,
         version,
         details,
+        GITHUB_API_BASE,
+        GITLAB_API_BASE,
+    )
+    .await
+}
+
+pub async fn check_repository_commit_provenance(
+    http: &reqwest::Client,
+    repository_url: &str,
+    version: &str,
+    commit: &str,
+) -> Result<Option<RepositoryReleaseProvenance>> {
+    check_repository_commit_provenance_with_api_bases(
+        http,
+        repository_url,
+        version,
+        commit,
         GITHUB_API_BASE,
         GITLAB_API_BASE,
     )
@@ -276,6 +309,7 @@ pub async fn check_release_provenance_with_api_bases(
             candidate_refs: candidate_version_refs(version),
             match_kind: RepositoryMatchKind::Unknown,
             matched_ref: None,
+            matched_commit: None,
             suspicious: false,
             reason: "repository host is not yet supported for release parity checks".to_string(),
         }));
@@ -283,12 +317,24 @@ pub async fn check_release_provenance_with_api_bases(
 
     match repository.provider {
         RepositoryProvider::Github => {
-            check_github_release_provenance_with_base(http, &repository, version, github_api_base)
-                .await
+            check_github_release_provenance_with_base(
+                http,
+                &repository,
+                version,
+                extract_embedded_repository_commit(ecosystem, details).as_deref(),
+                github_api_base,
+            )
+            .await
         }
         RepositoryProvider::Gitlab => {
-            check_gitlab_release_provenance_with_base(http, &repository, version, gitlab_api_base)
-                .await
+            check_gitlab_release_provenance_with_base(
+                http,
+                &repository,
+                version,
+                extract_embedded_repository_commit(ecosystem, details).as_deref(),
+                gitlab_api_base,
+            )
+            .await
         }
         RepositoryProvider::Unknown => Ok(None),
     }
@@ -385,7 +431,19 @@ async fn load_local_artifact_metadata(
                 .find(|entry| entry.ends_with("/Cargo.toml") || entry == "Cargo.toml")
                 .context("crate tarball does not contain Cargo.toml")?;
             let body = read_archive_entry(artifact_path, artifact_kind, &cargo_toml).await?;
-            parse_cargo_toml(&body)
+            let vcs_info_entry = list_archive_entries(artifact_path, artifact_kind)
+                .await?
+                .into_iter()
+                .find(|entry| {
+                    entry.ends_with("/.cargo_vcs_info.json") || entry == ".cargo_vcs_info.json"
+                });
+            let vcs_info = if let Some(entry) = vcs_info_entry {
+                let body = read_archive_entry(artifact_path, artifact_kind, &entry).await?;
+                serde_json::from_str::<Value>(&body).ok()
+            } else {
+                None
+            };
+            parse_cargo_toml(&body, vcs_info.as_ref())
         }
         _ => anyhow::bail!(
             "unsupported local provenance inspection for {:?} {}",
@@ -513,7 +571,7 @@ fn parse_npm_package_json(body: &str) -> Result<ArtifactMetadata> {
     })
 }
 
-fn parse_cargo_toml(body: &str) -> Result<ArtifactMetadata> {
+fn parse_cargo_toml(body: &str, vcs_info: Option<&Value>) -> Result<ArtifactMetadata> {
     let mut in_package = false;
     let mut version = None;
     let mut repository = None;
@@ -546,10 +604,32 @@ fn parse_cargo_toml(body: &str) -> Result<ArtifactMetadata> {
         details: serde_json::json!({
             "crate": {
                 "repository": repository,
-                "homepage": homepage
-            }
+                "homepage": homepage,
+                "vcs_commit": vcs_info.and_then(extract_vcs_commit_from_value)
+            },
+            "crate_vcs_info": vcs_info
         }),
     })
+}
+
+fn extract_embedded_repository_commit(ecosystem: Ecosystem, details: &Value) -> Option<String> {
+    match ecosystem {
+        Ecosystem::CratesIo => details
+            .pointer("/crate/vcs_commit")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                details
+                    .pointer("/crate_vcs_info")
+                    .and_then(extract_vcs_commit_from_value)
+                    .map(str::to_string)
+            }),
+        Ecosystem::Pypi | Ecosystem::Npm => None,
+    }
+}
+
+fn extract_vcs_commit_from_value(value: &Value) -> Option<&str> {
+    value.pointer("/git/sha1").and_then(Value::as_str)
 }
 
 #[derive(Default)]
@@ -727,18 +807,36 @@ async fn check_github_release_provenance_with_base(
     http: &reqwest::Client,
     repository: &ResolvedRepository,
     version: &str,
+    embedded_commit: Option<&str>,
     api_base: &str,
 ) -> Result<Option<RepositoryReleaseProvenance>> {
     let candidates = candidate_version_refs(version);
     let github_token = github_api_token();
+    if github_token.is_none()
+        && let Some(reason) = active_github_backoff_reason()
+    {
+        return Ok(Some(unknown_provenance(
+            repository, version, candidates, &reason,
+        )));
+    }
     let tags_url = format!(
         "{}/repos/{}/{}/tags?per_page=100",
         api_base, repository.owner, repository.name
     );
     let tags_cache_key = format!("{}|{}|{}", api_base, repository.owner, repository.name);
     let cached_tags = {
-        let guard = GITHUB_TAG_CACHE.lock().unwrap();
-        guard.get(&tags_cache_key).cloned()
+        let mut guard = GITHUB_TAG_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match guard.get_cloned_refresh(&tags_cache_key) {
+            Some(CachedGithubTags::Unknown(reason))
+                if is_transient_github_status_reason(&reason) =>
+            {
+                guard.remove(&tags_cache_key);
+                None
+            }
+            value => value,
+        }
     };
     let tags = match cached_tags {
         Some(CachedGithubTags::Names(names)) => names,
@@ -768,10 +866,10 @@ async fn check_github_release_provenance_with_base(
 
             if tags_response.status() == StatusCode::NOT_FOUND {
                 let reason = "GitHub repository or tags endpoint was not found".to_string();
-                GITHUB_TAG_CACHE
+                let mut cache = GITHUB_TAG_CACHE
                     .lock()
-                    .unwrap()
-                    .insert(tags_cache_key, CachedGithubTags::NotFound);
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                cache.insert(tags_cache_key, CachedGithubTags::NotFound);
                 return Ok(Some(unknown_provenance(
                     repository, version, candidates, &reason,
                 )));
@@ -781,10 +879,11 @@ async fn check_github_release_provenance_with_base(
                     "GitHub tags parity check returned status {}",
                     tags_response.status()
                 );
-                GITHUB_TAG_CACHE
+                note_github_backoff(tags_response.status(), &reason);
+                let mut cache = GITHUB_TAG_CACHE
                     .lock()
-                    .unwrap()
-                    .insert(tags_cache_key, CachedGithubTags::Unknown(reason.clone()));
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                cache.insert(tags_cache_key, CachedGithubTags::Unknown(reason.clone()));
                 return Ok(Some(unknown_provenance(
                     repository, version, candidates, &reason,
                 )));
@@ -801,10 +900,10 @@ async fn check_github_release_provenance_with_base(
                 .into_iter()
                 .filter_map(|tag| tag.get("name").and_then(Value::as_str).map(str::to_string))
                 .collect::<Vec<_>>();
-            GITHUB_TAG_CACHE
+            let mut cache = GITHUB_TAG_CACHE
                 .lock()
-                .unwrap()
-                .insert(tags_cache_key, CachedGithubTags::Names(names.clone()));
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.insert(tags_cache_key, CachedGithubTags::Names(names.clone()));
             names
         }
     };
@@ -820,6 +919,7 @@ async fn check_github_release_provenance_with_base(
                 candidate_refs: candidates.clone(),
                 match_kind: RepositoryMatchKind::Tag,
                 matched_ref: Some(candidate.clone()),
+                matched_commit: None,
                 suspicious: false,
                 reason: "found matching GitHub tag for package version".to_string(),
             }));
@@ -833,9 +933,8 @@ async fn check_github_release_provenance_with_base(
         );
         if let Some(found) = GITHUB_RELEASE_CACHE
             .lock()
-            .unwrap()
-            .get(&release_cache_key)
-            .copied()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_cloned_refresh(&release_cache_key)
         {
             if found {
                 return Ok(Some(RepositoryReleaseProvenance {
@@ -847,6 +946,7 @@ async fn check_github_release_provenance_with_base(
                     candidate_refs: candidates.clone(),
                     match_kind: RepositoryMatchKind::Release,
                     matched_ref: Some(candidate.clone()),
+                    matched_commit: None,
                     suspicious: false,
                     reason: "found matching GitHub release for package version".to_string(),
                 }));
@@ -870,10 +970,10 @@ async fn check_github_release_provenance_with_base(
                 )
             })?;
         if response.status() == StatusCode::OK {
-            GITHUB_RELEASE_CACHE
+            let mut cache = GITHUB_RELEASE_CACHE
                 .lock()
-                .unwrap()
-                .insert(release_cache_key, true);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.insert(release_cache_key, true);
             return Ok(Some(RepositoryReleaseProvenance {
                 provider: RepositoryProvider::Github,
                 repository_url: repository.repository_url.clone(),
@@ -883,25 +983,36 @@ async fn check_github_release_provenance_with_base(
                 candidate_refs: candidates.clone(),
                 match_kind: RepositoryMatchKind::Release,
                 matched_ref: Some(candidate.clone()),
+                matched_commit: None,
                 suspicious: false,
                 reason: "found matching GitHub release for package version".to_string(),
             }));
         }
         if response.status() == StatusCode::NOT_FOUND {
-            GITHUB_RELEASE_CACHE
+            let mut cache = GITHUB_RELEASE_CACHE
                 .lock()
-                .unwrap()
-                .insert(release_cache_key, false);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.insert(release_cache_key, false);
             continue;
         }
         if response.status() != StatusCode::NOT_FOUND {
+            let reason = format!(
+                "GitHub release parity check returned status {}",
+                response.status()
+            );
+            note_github_backoff(response.status(), &reason);
             return Ok(Some(unknown_provenance(
-                repository,
-                version,
-                candidates,
-                "GitHub release parity check returned an unexpected status",
+                repository, version, candidates, &reason,
             )));
         }
+    }
+
+    if let Some(commit) = embedded_commit
+        && let Some(provenance) =
+            check_github_commit_provenance_with_base(http, repository, version, commit, api_base)
+                .await?
+    {
+        return Ok(Some(provenance));
     }
 
     Ok(Some(mismatch_provenance(
@@ -921,6 +1032,39 @@ fn github_api_token() -> Option<String> {
                 .ok()
                 .filter(|value| !value.trim().is_empty())
         })
+}
+
+fn active_github_backoff_reason() -> Option<String> {
+    let mut guard = GITHUB_BACKOFF
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match guard.as_ref() {
+        Some(state) if Instant::now() < state.until => Some(state.reason.clone()),
+        Some(_) => {
+            *guard = None;
+            None
+        }
+        None => None,
+    }
+}
+
+fn note_github_backoff(status: StatusCode, reason: &str) {
+    if status != StatusCode::FORBIDDEN && status != StatusCode::TOO_MANY_REQUESTS {
+        return;
+    }
+    let mut guard = GITHUB_BACKOFF
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some(GithubBackoff {
+        until: Instant::now() + GITHUB_BACKOFF_DURATION,
+        reason: format!("{reason}; GitHub parity temporarily backed off"),
+    });
+}
+
+fn is_transient_github_status_reason(reason: &str) -> bool {
+    reason.contains("403 Forbidden")
+        || reason.contains("429 Too Many Requests")
+        || reason.contains("temporarily backed off")
 }
 
 fn github_request(
@@ -944,6 +1088,7 @@ async fn check_gitlab_release_provenance_with_base(
     http: &reqwest::Client,
     repository: &ResolvedRepository,
     version: &str,
+    embedded_commit: Option<&str>,
     api_base: &str,
 ) -> Result<Option<RepositoryReleaseProvenance>> {
     let candidates = candidate_version_refs(version);
@@ -952,7 +1097,11 @@ async fn check_gitlab_release_provenance_with_base(
 
     for candidate in &candidates {
         let cache_key = format!("{}|{}|{}", api_base, encoded_project, candidate);
-        if let Some(cached) = GITLAB_TAG_CACHE.lock().unwrap().get(&cache_key).cloned() {
+        if let Some(cached) = GITLAB_TAG_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_cloned_refresh(&cache_key)
+        {
             match cached {
                 CachedGitlabTag::Match { has_release } => {
                     return Ok(Some(RepositoryReleaseProvenance {
@@ -968,6 +1117,7 @@ async fn check_gitlab_release_provenance_with_base(
                             RepositoryMatchKind::Tag
                         },
                         matched_ref: Some(candidate.clone()),
+                        matched_commit: None,
                         suspicious: false,
                         reason: if has_release {
                             "found matching GitLab tag with release metadata for package version"
@@ -1005,10 +1155,10 @@ async fn check_gitlab_release_provenance_with_base(
                 )
             })?;
             let has_release = body.get("release").is_some_and(|value| !value.is_null());
-            GITLAB_TAG_CACHE
+            let mut cache = GITLAB_TAG_CACHE
                 .lock()
-                .unwrap()
-                .insert(cache_key, CachedGitlabTag::Match { has_release });
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.insert(cache_key, CachedGitlabTag::Match { has_release });
             return Ok(Some(RepositoryReleaseProvenance {
                 provider: RepositoryProvider::Gitlab,
                 repository_url: repository.repository_url.clone(),
@@ -1022,6 +1172,7 @@ async fn check_gitlab_release_provenance_with_base(
                     RepositoryMatchKind::Tag
                 },
                 matched_ref: Some(candidate.clone()),
+                matched_commit: None,
                 suspicious: false,
                 reason: if has_release {
                     "found matching GitLab tag with release metadata for package version"
@@ -1032,22 +1183,30 @@ async fn check_gitlab_release_provenance_with_base(
             }));
         }
         if response.status() == StatusCode::NOT_FOUND {
-            GITLAB_TAG_CACHE
+            let mut cache = GITLAB_TAG_CACHE
                 .lock()
-                .unwrap()
-                .insert(cache_key, CachedGitlabTag::NotFound);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.insert(cache_key, CachedGitlabTag::NotFound);
             continue;
         }
         if response.status() != StatusCode::NOT_FOUND {
             let reason = "GitLab release parity check returned an unexpected status".to_string();
-            GITLAB_TAG_CACHE
+            let mut cache = GITLAB_TAG_CACHE
                 .lock()
-                .unwrap()
-                .insert(cache_key, CachedGitlabTag::Unknown(reason.clone()));
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.insert(cache_key, CachedGitlabTag::Unknown(reason.clone()));
             return Ok(Some(unknown_provenance(
                 repository, version, candidates, &reason,
             )));
         }
+    }
+
+    if let Some(commit) = embedded_commit
+        && let Some(provenance) =
+            check_gitlab_commit_provenance_with_base(http, repository, version, commit, api_base)
+                .await?
+    {
+        return Ok(Some(provenance));
     }
 
     Ok(Some(mismatch_provenance(
@@ -1056,6 +1215,164 @@ async fn check_gitlab_release_provenance_with_base(
         candidates,
         "repository resolved on GitLab but no matching tag or release was found for the package version",
     )))
+}
+
+pub async fn check_repository_commit_provenance_with_api_bases(
+    http: &reqwest::Client,
+    repository_url: &str,
+    version: &str,
+    commit: &str,
+    github_api_base: &str,
+    gitlab_api_base: &str,
+) -> Result<Option<RepositoryReleaseProvenance>> {
+    let Some(repository) = resolve_repository(repository_url) else {
+        return Ok(None);
+    };
+
+    match repository.provider {
+        RepositoryProvider::Github => {
+            check_github_commit_provenance_with_base(
+                http,
+                &repository,
+                version,
+                commit,
+                github_api_base,
+            )
+            .await
+        }
+        RepositoryProvider::Gitlab => {
+            check_gitlab_commit_provenance_with_base(
+                http,
+                &repository,
+                version,
+                commit,
+                gitlab_api_base,
+            )
+            .await
+        }
+        RepositoryProvider::Unknown => Ok(None),
+    }
+}
+
+async fn check_github_commit_provenance_with_base(
+    http: &reqwest::Client,
+    repository: &ResolvedRepository,
+    version: &str,
+    commit: &str,
+    api_base: &str,
+) -> Result<Option<RepositoryReleaseProvenance>> {
+    if commit.trim().is_empty() {
+        return Ok(None);
+    }
+    let github_token = github_api_token();
+    if github_token.is_none()
+        && let Some(reason) = active_github_backoff_reason()
+    {
+        return Ok(Some(unknown_provenance(
+            repository,
+            version,
+            candidate_version_refs(version),
+            &reason,
+        )));
+    }
+    let url = format!(
+        "{}/repos/{}/{}/commits/{}",
+        api_base, repository.owner, repository.name, commit
+    );
+    let response = github_request(http.get(&url), github_token.as_deref())
+        .send()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to fetch GitHub commit for {}",
+                repository.normalized_repository_url
+            )
+        })?;
+    if response.status() == StatusCode::OK {
+        return Ok(Some(commit_provenance(
+            repository,
+            version,
+            commit,
+            "found embedded GitHub commit in upstream repository for package artifact",
+        )));
+    }
+    if response.status() != StatusCode::NOT_FOUND {
+        let reason = format!(
+            "GitHub commit provenance check returned status {}",
+            response.status()
+        );
+        note_github_backoff(response.status(), &reason);
+        return Ok(Some(unknown_provenance(
+            repository,
+            version,
+            candidate_version_refs(version),
+            &reason,
+        )));
+    }
+    Ok(None)
+}
+
+async fn check_gitlab_commit_provenance_with_base(
+    http: &reqwest::Client,
+    repository: &ResolvedRepository,
+    version: &str,
+    commit: &str,
+    api_base: &str,
+) -> Result<Option<RepositoryReleaseProvenance>> {
+    if commit.trim().is_empty() {
+        return Ok(None);
+    }
+    let project = format!("{}/{}", repository.owner, repository.name);
+    let url = format!(
+        "{}/projects/{}/repository/commits/{}",
+        api_base,
+        urlencoding::encode(&project),
+        urlencoding::encode(commit)
+    );
+    let response = http.get(&url).send().await.with_context(|| {
+        format!(
+            "failed to fetch GitLab commit for {}",
+            repository.normalized_repository_url
+        )
+    })?;
+    if response.status() == StatusCode::OK {
+        return Ok(Some(commit_provenance(
+            repository,
+            version,
+            commit,
+            "found embedded GitLab commit in upstream repository for package artifact",
+        )));
+    }
+    if response.status() != StatusCode::NOT_FOUND {
+        return Ok(Some(unknown_provenance(
+            repository,
+            version,
+            candidate_version_refs(version),
+            "GitLab commit provenance check returned an unexpected status",
+        )));
+    }
+    Ok(None)
+}
+
+fn commit_provenance(
+    repository: &ResolvedRepository,
+    version: &str,
+    commit: &str,
+    reason: &str,
+) -> RepositoryReleaseProvenance {
+    RepositoryReleaseProvenance {
+        provider: repository.provider,
+        repository_url: repository.repository_url.clone(),
+        normalized_repository_url: repository.normalized_repository_url.clone(),
+        package_version: version.to_string(),
+        checked_at: Utc::now(),
+        candidate_refs: candidate_version_refs(version),
+        match_kind: RepositoryMatchKind::Commit,
+        matched_ref: None,
+        matched_commit: Some(commit.to_string()),
+        suspicious: false,
+        reason: reason.to_string(),
+    }
 }
 
 fn mismatch_provenance(
@@ -1073,6 +1390,7 @@ fn mismatch_provenance(
         candidate_refs: candidates,
         match_kind: RepositoryMatchKind::None,
         matched_ref: None,
+        matched_commit: None,
         suspicious: true,
         reason: reason.to_string(),
     }
@@ -1093,6 +1411,7 @@ fn unknown_provenance(
         candidate_refs: candidates,
         match_kind: RepositoryMatchKind::Unknown,
         matched_ref: None,
+        matched_commit: None,
         suspicious: false,
         reason: reason.to_string(),
     }
@@ -1185,6 +1504,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_cargo_toml_with_embedded_vcs_commit() {
+        let metadata = parse_cargo_toml(
+            r#"[package]
+name = "unitforge"
+version = "0.3.18"
+repository = "https://gitlab.com/henrikjstromberg/unitforge"
+"#,
+            Some(&json!({"git":{"sha1":"5869fde797bb2bfa6686fabdf8437f0e4d130b9c"}})),
+        )
+        .unwrap();
+        assert_eq!(metadata.version, "0.3.18");
+        assert_eq!(
+            metadata
+                .details
+                .pointer("/crate/vcs_commit")
+                .and_then(Value::as_str),
+            Some("5869fde797bb2bfa6686fabdf8437f0e4d130b9c")
+        );
+    }
+
+    #[test]
     fn github_request_sets_expected_headers() {
         let http = reqwest::Client::builder().build().unwrap();
         let request = github_request(
@@ -1206,6 +1546,48 @@ mod tests {
             request.headers().get(AUTHORIZATION).unwrap(),
             "Bearer test_pat"
         );
+    }
+
+    #[test]
+    fn github_backoff_is_recorded_for_transient_statuses() {
+        *GITHUB_BACKOFF
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        note_github_backoff(
+            StatusCode::FORBIDDEN,
+            "GitHub tags parity check returned status 403 Forbidden",
+        );
+        let reason = active_github_backoff_reason().unwrap();
+        assert!(reason.contains("403 Forbidden"));
+        assert!(reason.contains("temporarily backed off"));
+        *GITHUB_BACKOFF
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    #[test]
+    fn repo_cache_evicts_oldest_when_full_for_new_key() {
+        let mut cache = BoundedMap::new(2);
+        cache.insert("one".to_string(), true);
+        cache.insert("two".to_string(), false);
+        cache.insert("three".to_string(), true);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&"one".to_string()).is_none());
+        assert_eq!(cache.get(&"two".to_string()), Some(&false));
+        assert_eq!(cache.get(&"three".to_string()), Some(&true));
+    }
+
+    #[test]
+    fn transient_github_status_reason_is_detected() {
+        assert!(is_transient_github_status_reason(
+            "GitHub tags parity check returned status 403 Forbidden"
+        ));
+        assert!(is_transient_github_status_reason(
+            "GitHub release parity check returned status 429 Too Many Requests"
+        ));
+        assert!(!is_transient_github_status_reason(
+            "GitHub repository or tags endpoint was not found"
+        ));
     }
 
     #[tokio::test]
@@ -1242,6 +1624,7 @@ mod tests {
             &http,
             &repository,
             "4.87.2",
+            None,
             &format!("http://{addr}"),
         )
         .await
@@ -1279,6 +1662,7 @@ mod tests {
             &http,
             &repository,
             "4.87.0",
+            None,
             &format!("http://{addr}"),
         )
         .await
@@ -1289,5 +1673,48 @@ mod tests {
         assert_eq!(result.match_kind, RepositoryMatchKind::Tag);
         assert!(!result.suspicious);
         assert_eq!(result.matched_ref.as_deref(), Some("v4.87.0"));
+    }
+
+    #[tokio::test]
+    async fn gitlab_commit_provenance_accepts_existing_commit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 4096];
+            let read = socket.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            let first_line = request.lines().next().unwrap_or_default();
+            let path = first_line.split_whitespace().nth(1).unwrap_or_default();
+            assert!(path.contains("/projects/henrikjstromberg%2Funitforge/repository/commits/5869fde797bb2bfa6686fabdf8437f0e4d130b9c"));
+            let body = r#"{"id":"5869fde797bb2bfa6686fabdf8437f0e4d130b9c"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let http = reqwest::Client::builder().build().unwrap();
+        let result = check_repository_commit_provenance_with_api_bases(
+            &http,
+            "https://gitlab.com/henrikjstromberg/unitforge",
+            "0.3.18",
+            "5869fde797bb2bfa6686fabdf8437f0e4d130b9c",
+            "https://api.github.com",
+            &format!("http://{addr}"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(result.match_kind, RepositoryMatchKind::Commit);
+        assert_eq!(
+            result.matched_commit.as_deref(),
+            Some("5869fde797bb2bfa6686fabdf8437f0e4d130b9c")
+        );
+        assert!(!result.suspicious);
     }
 }

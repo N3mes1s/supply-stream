@@ -6,7 +6,10 @@ use reqwest::StatusCode;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::event::Ecosystem;
+use crate::{
+    event::Ecosystem,
+    sources::{RequestThrottle, default_offline_resilience_config},
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VisibilityReport {
@@ -77,10 +80,20 @@ pub async fn locate_release(
     version: Option<&str>,
 ) -> Result<VisibilityReport> {
     let http = visibility_http_client()?;
+    let resilience = default_offline_resilience_config();
     let probes = match ecosystem {
-        Ecosystem::Pypi => locate_pypi(&http, package, version).await,
-        Ecosystem::Npm => locate_npm(&http, package, version).await,
-        Ecosystem::CratesIo => locate_crates_io(&http, package, version).await,
+        Ecosystem::Pypi => {
+            let throttle = RequestThrottle::new("visibility-pypi", &resilience);
+            locate_pypi(&http, &throttle, package, version).await
+        }
+        Ecosystem::Npm => {
+            let throttle = RequestThrottle::new("visibility-npm", &resilience);
+            locate_npm(&http, &throttle, package, version).await
+        }
+        Ecosystem::CratesIo => {
+            let throttle = RequestThrottle::new("visibility-crates-io", &resilience);
+            locate_crates_io(&http, &throttle, package, version).await
+        }
     };
 
     Ok(VisibilityReport {
@@ -103,14 +116,16 @@ fn visibility_http_client() -> Result<reqwest::Client> {
 
 async fn locate_pypi(
     http: &reqwest::Client,
+    throttle: &RequestThrottle,
     package: &str,
     version: Option<&str>,
 ) -> Vec<ProbeResult> {
     let mut probes = Vec::new();
-    probes.push(probe_pypi_project_json(http, package, version).await);
+    probes.push(probe_pypi_project_json(http, throttle, package, version).await);
     probes.push(
         probe_pypi_simple(
             http,
+            throttle,
             "pypi.simple",
             format!(
                 "https://pypi.org/simple/{}/",
@@ -124,6 +139,7 @@ async fn locate_pypi(
     probes.push(
         probe_pypi_simple(
             http,
+            throttle,
             "pypi.mirror.aliyun.simple",
             format!(
                 "https://mirrors.aliyun.com/pypi/simple/{}/",
@@ -137,6 +153,7 @@ async fn locate_pypi(
     probes.push(
         probe_pypi_simple(
             http,
+            throttle,
             "pypi.mirror.tuna.simple",
             format!(
                 "https://pypi.tuna.tsinghua.edu.cn/simple/{}/",
@@ -150,6 +167,7 @@ async fn locate_pypi(
     probes.push(
         probe_pypi_simple(
             http,
+            throttle,
             "pypi.mirror.ustc.simple",
             format!(
                 "https://pypi.mirrors.ustc.edu.cn/simple/{}/",
@@ -163,6 +181,7 @@ async fn locate_pypi(
     probes.push(
         probe_pypi_simple(
             http,
+            throttle,
             "pypi.piwheels.simple",
             format!(
                 "https://www.piwheels.org/simple/{}/",
@@ -178,6 +197,7 @@ async fn locate_pypi(
 
 async fn probe_pypi_project_json(
     http: &reqwest::Client,
+    throttle: &RequestThrottle,
     package: &str,
     version: Option<&str>,
 ) -> ProbeResult {
@@ -185,7 +205,10 @@ async fn probe_pypi_project_json(
         "https://pypi.org/pypi/{}/json",
         urlencoding::encode(package)
     );
-    let response = match http.get(&url).send().await {
+    let response = match throttle
+        .send_without_shutdown(|| http.get(&url).send())
+        .await
+    {
         Ok(response) => response,
         Err(error) => {
             return ProbeResult::error(
@@ -285,12 +308,16 @@ async fn probe_pypi_project_json(
 
 async fn probe_pypi_simple(
     http: &reqwest::Client,
+    throttle: &RequestThrottle,
     name: &str,
     url: String,
     package: &str,
     version: Option<&str>,
 ) -> ProbeResult {
-    let response = match http.get(&url).send().await {
+    let response = match throttle
+        .send_without_shutdown(|| http.get(&url).send())
+        .await
+    {
         Ok(response) => response,
         Err(error) => {
             return ProbeResult::error(name, url, json!({ "error": error.to_string() }));
@@ -357,36 +384,84 @@ async fn probe_pypi_simple(
 
 async fn locate_npm(
     http: &reqwest::Client,
+    throttle: &RequestThrottle,
     package: &str,
     version: Option<&str>,
 ) -> Vec<ProbeResult> {
-    vec![
-        probe_npm_packument(http, package, version).await,
-        probe_npm_package_json(
-            http,
-            "npm.unpkg.package-json",
-            match version {
-                Some(version) => format!("https://unpkg.com/{package}@{version}/package.json"),
-                None => format!("https://unpkg.com/{package}/package.json"),
-            },
-        )
-        .await,
-        probe_npm_package_json(
-            http,
-            "npm.jsdelivr.package-json",
-            match version {
-                Some(version) => {
-                    format!("https://cdn.jsdelivr.net/npm/{package}@{version}/package.json")
-                }
-                None => format!("https://cdn.jsdelivr.net/npm/{package}/package.json"),
-            },
-        )
-        .await,
-    ]
+    let mut probes = Vec::new();
+    probes.push(probe_npm_packument(http, throttle, package, version).await);
+
+    let unpkg_package_json_url = match version {
+        Some(version) => format!("https://unpkg.com/{package}@{version}/package.json"),
+        None => format!("https://unpkg.com/{package}/package.json"),
+    };
+    let unpkg_package_json = probe_npm_package_json(
+        http,
+        throttle,
+        "npm.unpkg.package-json",
+        unpkg_package_json_url,
+    )
+    .await;
+    probes.push(unpkg_package_json);
+
+    let jsdelivr_package_json_url = match version {
+        Some(version) => format!("https://cdn.jsdelivr.net/npm/{package}@{version}/package.json"),
+        None => format!("https://cdn.jsdelivr.net/npm/{package}/package.json"),
+    };
+    let jsdelivr_package_json = probe_npm_package_json(
+        http,
+        throttle,
+        "npm.jsdelivr.package-json",
+        jsdelivr_package_json_url,
+    )
+    .await;
+    let npmmirror_package_json_url = match version {
+        Some(version) => format!("https://registry.npmmirror.com/{package}/{version}"),
+        None => format!("https://registry.npmmirror.com/{package}/latest"),
+    };
+    let npmmirror_package_json = probe_npm_package_json(
+        http,
+        throttle,
+        "npm.npmmirror.package-json",
+        npmmirror_package_json_url,
+    )
+    .await;
+    if let Some(version) = version {
+        probes.push(probe_npm_tarball(http, throttle, package, version).await);
+        probes.extend(
+            npm_entry_file_probes(
+                http,
+                throttle,
+                package,
+                version,
+                "https://cdn.jsdelivr.net/npm",
+                "npm.jsdelivr.entry-file",
+                &jsdelivr_package_json,
+            )
+            .await,
+        );
+        probes.push(probe_npm_npmmirror_tarball(http, throttle, package, version).await);
+        probes.extend(
+            npm_entry_file_probes(
+                http,
+                throttle,
+                package,
+                version,
+                "https://registry.npmmirror.com",
+                "npm.npmmirror.entry-file",
+                &npmmirror_package_json,
+            )
+            .await,
+        );
+    }
+    probes.push(jsdelivr_package_json);
+    probes.push(npmmirror_package_json);
+    probes
 }
 
 async fn probe_npm_packument(
     http: &reqwest::Client,
+    throttle: &RequestThrottle,
     package: &str,
     version: Option<&str>,
 ) -> ProbeResult {
@@ -394,7 +469,10 @@ async fn probe_npm_packument(
         "https://registry.npmjs.org/{}",
         urlencoding::encode(package)
     );
-    let response = match http.get(&url).send().await {
+    let response = match throttle
+        .send_without_shutdown(|| http.get(&url).send())
+        .await
+    {
         Ok(response) => response,
         Err(error) => {
             return ProbeResult::error(
@@ -485,8 +563,16 @@ async fn probe_npm_packument(
     }
 }
 
-async fn probe_npm_package_json(http: &reqwest::Client, name: &str, url: String) -> ProbeResult {
-    let response = match http.get(&url).send().await {
+async fn probe_npm_package_json(
+    http: &reqwest::Client,
+    throttle: &RequestThrottle,
+    name: &str,
+    url: String,
+) -> ProbeResult {
+    let response = match throttle
+        .send_without_shutdown(|| http.get(&url).send())
+        .await
+    {
         Ok(response) => response,
         Err(error) => {
             return ProbeResult::error(name, url, json!({ "error": error.to_string() }));
@@ -516,25 +602,272 @@ async fn probe_npm_package_json(http: &reqwest::Client, name: &str, url: String)
         json!({
             "resolved_url": final_url,
             "name": body.get("name"),
-            "version": body.get("version")
+            "version": body.get("version"),
+            "dependencies": npm_dependency_names(&body),
+            "main": body.get("main"),
+            "module": body.get("module")
         }),
     )
 }
 
+async fn probe_npm_tarball(
+    http: &reqwest::Client,
+    throttle: &RequestThrottle,
+    package: &str,
+    version: &str,
+) -> ProbeResult {
+    let url = npm_tarball_url(package, version);
+    let response = match throttle
+        .send_without_shutdown(|| http.head(&url).send())
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return ProbeResult::error(
+                "npm.registry.tarball",
+                url,
+                json!({ "error": error.to_string() }),
+            );
+        }
+    };
+
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND {
+        return ProbeResult::missing(
+            "npm.registry.tarball",
+            url,
+            None,
+            json!({ "http_status": status.as_u16() }),
+        );
+    }
+    if !status.is_success() {
+        return ProbeResult::error(
+            "npm.registry.tarball",
+            url,
+            json!({ "http_status": status.as_u16() }),
+        );
+    }
+
+    ProbeResult::visible(
+        "npm.registry.tarball",
+        url,
+        None,
+        json!({
+            "content_length": response
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            "content_type": response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+        }),
+    )
+}
+
+async fn npm_entry_file_probes(
+    http: &reqwest::Client,
+    throttle: &RequestThrottle,
+    package: &str,
+    version: &str,
+    base_url: &str,
+    probe_name: &str,
+    package_json_probe: &ProbeResult,
+) -> Vec<ProbeResult> {
+    if package_json_probe.state != ProbeState::Visible {
+        return Vec::new();
+    }
+    let paths = npm_entry_paths_from_detail(&package_json_probe.detail);
+    let mut probes = Vec::new();
+    for path in paths {
+        let url = if base_url.contains("npmmirror.com") {
+            format!("{base_url}/{package}/{version}/{path}")
+        } else {
+            format!("{base_url}/{package}@{version}/{path}")
+        };
+        probes.push(probe_npm_file(http, throttle, probe_name, url, path).await);
+    }
+    probes
+}
+
+async fn probe_npm_file(
+    http: &reqwest::Client,
+    throttle: &RequestThrottle,
+    name: &str,
+    url: String,
+    path: String,
+) -> ProbeResult {
+    let response = match throttle
+        .send_without_shutdown(|| http.head(&url).send())
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return ProbeResult::error(
+                name,
+                url,
+                json!({
+                    "path": path,
+                    "error": error.to_string()
+                }),
+            );
+        }
+    };
+
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND {
+        return ProbeResult::missing(
+            name,
+            url,
+            None,
+            json!({
+                "path": path,
+                "http_status": status.as_u16()
+            }),
+        );
+    }
+    if !status.is_success() {
+        return ProbeResult::error(
+            name,
+            url,
+            json!({
+                "path": path,
+                "http_status": status.as_u16()
+            }),
+        );
+    }
+
+    ProbeResult::visible(
+        name,
+        url,
+        None,
+        json!({
+            "path": path,
+            "content_length": response
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            "content_type": response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+        }),
+    )
+}
+
+fn npm_dependency_names(body: &Value) -> Vec<String> {
+    body.get("dependencies")
+        .and_then(Value::as_object)
+        .map(|dependencies| {
+            let mut names = dependencies.keys().cloned().collect::<Vec<_>>();
+            names.sort();
+            names
+        })
+        .unwrap_or_default()
+}
+
+fn npm_entry_paths_from_detail(detail: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    for value in [
+        detail.get("main").and_then(Value::as_str),
+        detail.get("module").and_then(Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let normalized = value.trim().trim_start_matches("./");
+        if !normalized.is_empty() && !paths.iter().any(|existing| existing == normalized) {
+            paths.push(normalized.to_string());
+        }
+    }
+    paths
+}
+
+fn npm_tarball_url(package: &str, version: &str) -> String {
+    let basename = npm_package_basename(package);
+    format!("https://registry.npmjs.org/{package}/-/{basename}-{version}.tgz")
+}
+
+fn npm_npmmirror_tarball_url(package: &str, version: &str) -> String {
+    let basename = npm_package_basename(package);
+    format!("https://registry.npmmirror.com/{package}/-/{basename}-{version}.tgz")
+}
+
+async fn probe_npm_npmmirror_tarball(
+    http: &reqwest::Client,
+    throttle: &RequestThrottle,
+    package: &str,
+    version: &str,
+) -> ProbeResult {
+    let url = npm_npmmirror_tarball_url(package, version);
+    let response = match throttle
+        .send_without_shutdown(|| http.head(&url).send())
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return ProbeResult::error(
+                "npm.npmmirror.tarball",
+                url,
+                json!({ "error": error.to_string() }),
+            );
+        }
+    };
+
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND {
+        return ProbeResult::missing(
+            "npm.npmmirror.tarball",
+            url,
+            None,
+            json!({ "http_status": status.as_u16() }),
+        );
+    }
+    if !status.is_success() {
+        return ProbeResult::error(
+            "npm.npmmirror.tarball",
+            url,
+            json!({ "http_status": status.as_u16() }),
+        );
+    }
+
+    ProbeResult::visible(
+        "npm.npmmirror.tarball",
+        url,
+        None,
+        json!({
+            "content_length": response
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            "content_type": response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+        }),
+    )
+}
+
+fn npm_package_basename(package: &str) -> &str {
+    package.rsplit('/').next().unwrap_or(package)
+}
+
 async fn locate_crates_io(
     http: &reqwest::Client,
+    throttle: &RequestThrottle,
     package: &str,
     version: Option<&str>,
 ) -> Vec<ProbeResult> {
     vec![
-        probe_crates_api(http, package, version).await,
-        probe_crates_index(http, package, version).await,
-        probe_crates_download(http, package, version).await,
+        probe_crates_api(http, throttle, package, version).await,
+        probe_crates_index(http, throttle, package, version).await,
+        probe_crates_download(http, throttle, package, version).await,
     ]
 }
 
 async fn probe_crates_api(
     http: &reqwest::Client,
+    throttle: &RequestThrottle,
     package: &str,
     version: Option<&str>,
 ) -> ProbeResult {
@@ -542,7 +875,10 @@ async fn probe_crates_api(
         "https://crates.io/api/v1/crates/{}",
         urlencoding::encode(package)
     );
-    let response = match http.get(&url).send().await {
+    let response = match throttle
+        .send_without_shutdown(|| http.get(&url).send())
+        .await
+    {
         Ok(response) => response,
         Err(error) => {
             return ProbeResult::error("crates.api", url, json!({ "error": error.to_string() }));
@@ -617,12 +953,16 @@ async fn probe_crates_api(
 
 async fn probe_crates_index(
     http: &reqwest::Client,
+    throttle: &RequestThrottle,
     package: &str,
     version: Option<&str>,
 ) -> ProbeResult {
     let index_path = crates_index_path(package);
     let url = format!("https://index.crates.io/{index_path}");
-    let response = match http.get(&url).send().await {
+    let response = match throttle
+        .send_without_shutdown(|| http.get(&url).send())
+        .await
+    {
         Ok(response) => response,
         Err(error) => {
             return ProbeResult::error("crates.index", url, json!({ "error": error.to_string() }));
@@ -691,6 +1031,7 @@ async fn probe_crates_index(
 
 async fn probe_crates_download(
     http: &reqwest::Client,
+    throttle: &RequestThrottle,
     package: &str,
     version: Option<&str>,
 ) -> ProbeResult {
@@ -703,7 +1044,10 @@ async fn probe_crates_download(
     };
 
     let url = format!("https://crates.io/api/v1/crates/{package}/{version}/download");
-    let response = match http.head(&url).send().await {
+    let response = match throttle
+        .send_without_shutdown(|| http.head(&url).send())
+        .await
+    {
         Ok(response) => response,
         Err(error) => {
             return ProbeResult::error(
@@ -855,5 +1199,40 @@ mod tests {
         assert_eq!(crates_index_path("ab"), "2/ab");
         assert_eq!(crates_index_path("abc"), "3/a/abc");
         assert_eq!(crates_index_path("serde"), "se/rd/serde");
+    }
+
+    #[test]
+    fn computes_npm_tarball_urls_for_scoped_and_unscoped_packages() {
+        assert_eq!(
+            npm_tarball_url("axios", "1.14.1"),
+            "https://registry.npmjs.org/axios/-/axios-1.14.1.tgz"
+        );
+        assert_eq!(
+            npm_tarball_url("@scope/demo", "1.2.3"),
+            "https://registry.npmjs.org/@scope/demo/-/demo-1.2.3.tgz"
+        );
+    }
+
+    #[test]
+    fn extracts_npm_entry_paths_and_dependencies_from_package_json() {
+        let detail = json!({
+            "main": "./dist/node/axios.cjs",
+            "module": "./index.js",
+            "dependencies": {
+                "plain-crypto-js": "^4.2.1",
+                "follow-redirects": "^1.15.11"
+            }
+        });
+        assert_eq!(
+            npm_entry_paths_from_detail(&detail),
+            vec!["dist/node/axios.cjs".to_string(), "index.js".to_string()]
+        );
+        assert_eq!(
+            npm_dependency_names(&detail),
+            vec![
+                "follow-redirects".to_string(),
+                "plain-crypto-js".to_string()
+            ]
+        );
     }
 }

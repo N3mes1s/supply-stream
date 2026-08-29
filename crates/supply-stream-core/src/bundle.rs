@@ -123,9 +123,13 @@ pub async fn build_release_bundle(
             suspicious: assessment.suspicious,
             signal_type: "repo_graph_diff_fusion",
             severity: assessment.severity,
+            verdict_class: assessment.verdict_class,
             priority_tier: event.priority_snapshot().tier,
             graph: assessment.graph,
             factors: assessment.factors,
+            behavior_tags: assessment.behavior_tags,
+            matched_rules: assessment.matched_rules,
+            matched_evidence: assessment.matched_evidence,
             reason: assessment.reason,
             repository,
             diff: assessment.diff,
@@ -141,6 +145,13 @@ pub async fn build_release_bundle(
         diff,
         release_assessment,
     })
+}
+
+pub fn should_publish_live_bundle(bundle: &ReleaseEvidenceBundle) -> bool {
+    bundle
+        .release_assessment
+        .as_ref()
+        .is_some_and(|assessment| assessment.suspicious)
 }
 
 fn diff_assessment_input_from_value(value: &Value) -> Option<DiffAssessmentInput> {
@@ -218,6 +229,18 @@ fn diff_assessment_input_from_value(value: &Value) -> Option<DiffAssessmentInput
             &files_removed,
             &files_changed,
         ),
+        target_has_install_scripts: content
+            .and_then(|value| value.get("npm_install_hook"))
+            .and_then(|value| value.get("target_has_install_scripts"))
+            .and_then(Value::as_bool),
+        install_scripts_longstanding: content
+            .and_then(|value| value.get("npm_install_hook"))
+            .and_then(|value| value.get("longstanding_unchanged"))
+            .and_then(Value::as_bool),
+        install_hook_changed: content
+            .and_then(|value| value.get("npm_install_hook"))
+            .and_then(|value| value.get("effective_changed"))
+            .and_then(Value::as_bool),
     })
 }
 
@@ -350,7 +373,7 @@ mod tests {
             }
         });
 
-        let bundle =
+        let mut bundle =
             write_release_bundle(&data_dir, &store, &event, Some(&capture), Some(&diff)).await?;
 
         assert_eq!(bundle.kind, "release_evidence_bundle");
@@ -359,6 +382,13 @@ mod tests {
         assert!(bundle.diff.is_some());
         assert!(bundle.release_assessment.is_some());
         assert!(bundle.event.graph.known_in_local_graph);
+        assert!(!should_publish_live_bundle(&bundle));
+        bundle
+            .release_assessment
+            .as_mut()
+            .expect("release assessment")
+            .suspicious = true;
+        assert!(should_publish_live_bundle(&bundle));
         Ok(())
     }
 

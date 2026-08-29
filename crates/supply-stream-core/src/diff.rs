@@ -22,6 +22,7 @@ use crate::{
     capture::{ArtifactHashes, CapturedArtifact, CapturedRelease, ReleaseStatus},
     event::Ecosystem,
     history::{self, HistoryEntry},
+    install_scripts::npm_install_scripts,
 };
 
 pub const DEFAULT_PATCH_CONTEXT: usize = 3;
@@ -147,6 +148,37 @@ pub struct ContentDiff {
     pub files_changed_detail: Vec<FileRecordChange>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_patches: Vec<FilePatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub npm_install_hook: Option<NpmInstallHookDiff>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crate_repository_commit: Option<CrateRepositoryCommitDiff>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NpmInstallHookDiff {
+    pub baseline_has_install_scripts: bool,
+    pub target_has_install_scripts: bool,
+    pub scripts_changed: bool,
+    pub hook_files_changed: bool,
+    pub effective_changed: bool,
+    pub longstanding_unchanged: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub baseline_scripts: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub target_scripts: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub referenced_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub referenced_files_changed: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CrateRepositoryCommitDiff {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_commit: Option<String>,
+    pub commit_changed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1322,6 +1354,8 @@ async fn build_content_diff(
                 files_removed_detail: compared.removed_detail,
                 files_changed_detail: compared.changed_detail,
                 file_patches: compared.file_patches,
+                npm_install_hook: compared.npm_install_hook,
+                crate_repository_commit: compared.crate_repository_commit,
             },
             Err(error) => {
                 unavailable_content_diff(&format!("failed to compare extracted content: {error}"))
@@ -2051,6 +2085,8 @@ fn unavailable_content_diff(reason: &str) -> ContentDiff {
         files_removed_detail: Vec::new(),
         files_changed_detail: Vec::new(),
         file_patches: Vec::new(),
+        npm_install_hook: None,
+        crate_repository_commit: None,
     }
 }
 
@@ -2185,6 +2221,8 @@ struct ComparedContent {
     removed_detail: Vec<FileRecord>,
     changed_detail: Vec<FileRecordChange>,
     file_patches: Vec<FilePatch>,
+    npm_install_hook: Option<NpmInstallHookDiff>,
+    crate_repository_commit: Option<CrateRepositoryCommitDiff>,
 }
 
 async fn materialize_artifact(
@@ -2343,6 +2381,11 @@ fn compare_extracted_dirs(
         }
     }
 
+    let npm_install_hook =
+        derive_npm_install_hook_diff(&baseline_files, &target_files, &added, &removed, &changed)?;
+    let crate_repository_commit =
+        derive_crate_repository_commit_diff(&baseline_files, &target_files)?;
+
     Ok(ComparedContent {
         added,
         removed,
@@ -2351,7 +2394,179 @@ fn compare_extracted_dirs(
         removed_detail,
         changed_detail,
         file_patches,
+        npm_install_hook,
+        crate_repository_commit,
     })
+}
+
+fn derive_npm_install_hook_diff(
+    baseline_files: &BTreeMap<String, PathBuf>,
+    target_files: &BTreeMap<String, PathBuf>,
+    added: &[String],
+    removed: &[String],
+    changed: &[String],
+) -> Result<Option<NpmInstallHookDiff>> {
+    let baseline_package_json = read_json_file_from_map(baseline_files, "package.json")?;
+    let target_package_json = read_json_file_from_map(target_files, "package.json")?;
+    if baseline_package_json.is_none() && target_package_json.is_none() {
+        return Ok(None);
+    }
+
+    let baseline_scripts = baseline_package_json
+        .as_ref()
+        .map(npm_install_scripts)
+        .unwrap_or_default();
+    let target_scripts = target_package_json
+        .as_ref()
+        .map(npm_install_scripts)
+        .unwrap_or_default();
+    let baseline_has_install_scripts = !baseline_scripts.is_empty();
+    let target_has_install_scripts = !target_scripts.is_empty();
+    let scripts_changed = baseline_scripts != target_scripts;
+
+    let referenced_files = install_script_file_refs(&baseline_scripts, &target_scripts);
+    let changed_paths = added
+        .iter()
+        .chain(removed.iter())
+        .chain(changed.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let referenced_files_changed = referenced_files
+        .iter()
+        .filter(|path| changed_paths.contains(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let hook_files_changed = !referenced_files_changed.is_empty();
+    let effective_changed = scripts_changed || hook_files_changed;
+    let longstanding_unchanged =
+        target_has_install_scripts && baseline_has_install_scripts && !effective_changed;
+
+    Ok(Some(NpmInstallHookDiff {
+        baseline_has_install_scripts,
+        target_has_install_scripts,
+        scripts_changed,
+        hook_files_changed,
+        effective_changed,
+        longstanding_unchanged,
+        baseline_scripts,
+        target_scripts,
+        referenced_files,
+        referenced_files_changed,
+    }))
+}
+
+fn read_json_file_from_map(
+    files: &BTreeMap<String, PathBuf>,
+    path: &str,
+) -> Result<Option<serde_json::Value>> {
+    let Some(file_path) = files.get(path) else {
+        return Ok(None);
+    };
+    let bytes =
+        fs::read(file_path).with_context(|| format!("failed to read {}", file_path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", file_path.display()))
+        .map(Some)
+}
+
+fn read_json_file_by_suffix_from_map(
+    files: &BTreeMap<String, PathBuf>,
+    suffix: &str,
+) -> Result<Option<serde_json::Value>> {
+    if let Some(value) = read_json_file_from_map(files, suffix)? {
+        return Ok(Some(value));
+    }
+
+    let Some((_, file_path)) = files.iter().find(|(path, file_path)| {
+        path == &suffix
+            || path.ends_with(&format!("/{suffix}"))
+            || file_path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name == suffix)
+    }) else {
+        return Ok(None);
+    };
+
+    let bytes =
+        fs::read(file_path).with_context(|| format!("failed to read {}", file_path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", file_path.display()))
+        .map(Some)
+}
+
+fn derive_crate_repository_commit_diff(
+    baseline_files: &BTreeMap<String, PathBuf>,
+    target_files: &BTreeMap<String, PathBuf>,
+) -> Result<Option<CrateRepositoryCommitDiff>> {
+    let baseline_commit =
+        read_json_file_by_suffix_from_map(baseline_files, ".cargo_vcs_info.json")?
+            .as_ref()
+            .and_then(crate_vcs_commit_from_value)
+            .map(str::to_string);
+    let target_commit = read_json_file_by_suffix_from_map(target_files, ".cargo_vcs_info.json")?
+        .as_ref()
+        .and_then(crate_vcs_commit_from_value)
+        .map(str::to_string);
+
+    if baseline_commit.is_none() && target_commit.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(CrateRepositoryCommitDiff {
+        commit_changed: baseline_commit != target_commit,
+        baseline_commit,
+        target_commit,
+    }))
+}
+
+fn crate_vcs_commit_from_value(value: &serde_json::Value) -> Option<&str> {
+    value
+        .pointer("/git/sha1")
+        .and_then(serde_json::Value::as_str)
+}
+
+fn install_script_file_refs(
+    baseline_scripts: &BTreeMap<String, String>,
+    target_scripts: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut refs = BTreeSet::new();
+    for script in baseline_scripts.values().chain(target_scripts.values()) {
+        for token in script.split_whitespace() {
+            let trimmed = token.trim_matches(|ch: char| {
+                matches!(ch, '"' | '\'' | '`' | ';' | ',' | '(' | ')' | '[' | ']')
+            });
+            if trimmed.is_empty()
+                || trimmed.starts_with('-')
+                || trimmed.contains("://")
+                || trimmed.starts_with('$')
+                || trimmed.contains("${")
+            {
+                continue;
+            }
+
+            let normalized = trimmed
+                .trim_start_matches("./")
+                .trim_start_matches(".\\")
+                .replace('\\', "/");
+            if !looks_like_local_script_path(&normalized) {
+                continue;
+            }
+            refs.insert(normalized);
+        }
+    }
+    refs.into_iter().collect()
+}
+
+fn looks_like_local_script_path(path: &str) -> bool {
+    if !(path.contains('/') || path.contains('.')) {
+        return false;
+    }
+    [
+        ".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".sh", ".bash", ".zsh", ".ps1", ".py",
+    ]
+    .iter()
+    .any(|suffix| path.ends_with(suffix))
 }
 
 fn build_file_patch(
@@ -2720,6 +2935,8 @@ mod tests {
                     ),
                     reason: None,
                 }],
+                npm_install_hook: None,
+                crate_repository_commit: None,
             },
             notes: vec!["target artifact source: /tmp/litellm-1.82.8.whl".to_string()],
         };
@@ -2801,6 +3018,83 @@ mod tests {
                 .as_deref()
                 .is_some_and(|patch| patch.contains("+++ target/litellm_init.pth"))
         );
+    }
+
+    #[test]
+    fn compare_extracted_dirs_tracks_unchanged_npm_install_hook() {
+        let temp = tempdir().unwrap();
+        let baseline_dir = temp.path().join("baseline");
+        let target_dir = temp.path().join("target");
+        std::fs::create_dir_all(baseline_dir.join("package/scripts")).unwrap();
+        std::fs::create_dir_all(target_dir.join("package/scripts")).unwrap();
+        std::fs::write(
+            baseline_dir.join("package").join("package.json"),
+            r#"{"name":"demo","version":"1.0.0","scripts":{"postinstall":"node ./scripts/postinstall.mjs"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            target_dir.join("package").join("package.json"),
+            r#"{"name":"demo","version":"1.0.1","scripts":{"postinstall":"node ./scripts/postinstall.mjs"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            baseline_dir.join("package/scripts").join("postinstall.mjs"),
+            "console.log('hi')\n",
+        )
+        .unwrap();
+        std::fs::write(
+            target_dir.join("package/scripts").join("postinstall.mjs"),
+            "console.log('hi')\n",
+        )
+        .unwrap();
+
+        let compared = compare_extracted_dirs(&baseline_dir, &target_dir, false, 3).unwrap();
+        let hook = compared
+            .npm_install_hook
+            .expect("npm install hook evidence");
+        assert!(hook.baseline_has_install_scripts);
+        assert!(hook.target_has_install_scripts);
+        assert!(!hook.scripts_changed);
+        assert!(!hook.hook_files_changed);
+        assert!(hook.longstanding_unchanged);
+        assert_eq!(
+            hook.referenced_files,
+            vec!["scripts/postinstall.mjs".to_string()]
+        );
+        assert!(hook.referenced_files_changed.is_empty());
+    }
+
+    #[test]
+    fn compare_extracted_dirs_extracts_crate_vcs_commit() {
+        let temp = tempdir().unwrap();
+        let baseline_dir = temp.path().join("baseline");
+        let target_dir = temp.path().join("target");
+        std::fs::create_dir_all(&baseline_dir).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(
+            baseline_dir.join(".cargo_vcs_info.json"),
+            r#"{"git":{"sha1":"49a3f617e6279b711d1a0f6f9e5461b2b931d3f9"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            target_dir.join(".cargo_vcs_info.json"),
+            r#"{"git":{"sha1":"5869fde797bb2bfa6686fabdf8437f0e4d130b9c"}}"#,
+        )
+        .unwrap();
+
+        let compared = compare_extracted_dirs(&baseline_dir, &target_dir, false, 3).unwrap();
+        let commit = compared
+            .crate_repository_commit
+            .expect("crate vcs commit evidence");
+        assert_eq!(
+            commit.baseline_commit.as_deref(),
+            Some("49a3f617e6279b711d1a0f6f9e5461b2b931d3f9")
+        );
+        assert_eq!(
+            commit.target_commit.as_deref(),
+            Some("5869fde797bb2bfa6686fabdf8437f0e4d130b9c")
+        );
+        assert!(commit.commit_changed);
     }
 
     #[tokio::test]

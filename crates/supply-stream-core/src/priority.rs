@@ -2,24 +2,28 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 use tracing::{debug, info, warn};
 
 use crate::{
-    capture::CapturedRelease,
+    bounded_map::BoundedMap,
+    capture::{
+        CapturedRelease, captured_metadata_risk, graph_records_from_captured_release,
+        hydrate_release_metadata_for_priority, package_repository_identity_from_captured_release,
+    },
     collector::{self, SeedPackageRecord},
     config::PriorityConfig,
     deps_dev_bigquery::{self, LiveFocusConfig},
     event::{Ecosystem, EmittedGraphEvidence, PackageReleaseEvent},
+    repo_provenance::PackageRepositoryIdentity as RepoPackageRepositoryIdentity,
     scoring,
     store::{
         GraphEvidence, GraphNeighborhood, GraphNeighborhoodRecords, OperationalStore,
@@ -31,6 +35,10 @@ const ECOSYSTE_MS_PACKAGES_BASE: &str = "https://packages.ecosyste.ms/api/v1";
 const ECOSYSTE_MS_REPOS_USAGE_BASE: &str = "https://repos.ecosyste.ms/api/v1/usage";
 const FALLBACK_MIN_MEDIUM_PROPAGATED_IMPACT: f64 = 10.0;
 const FALLBACK_MIN_HIGH_PROPAGATED_IMPACT: f64 = 100.0;
+const PACKAGE_CENSUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_OBSERVATION_COUNT_ENTRIES: usize = 100_000;
+const MAX_ONLINE_FALLBACK_CACHE_ENTRIES: usize = 50_000;
+const MAX_EMITTED_GRAPH_EVIDENCE_CACHE_ENTRIES: usize = 50_000;
 
 #[derive(Debug, Clone)]
 pub struct PriorityResolver {
@@ -51,9 +59,11 @@ struct PriorityResolverInner {
     observed_package_recorder: ObservedPackageRecorder,
     package_census: PackageCensus,
     local_graph_fallback: Option<LocalGraphFallback>,
+    inline_observed_hydrator: Option<InlineObservedHydrator>,
     online_fallback: Option<OnlinePriorityFallback>,
     online_expander: Option<OnlinePriorityExpander>,
-    observation_counts: Mutex<HashMap<(Ecosystem, String), usize>>,
+    observation_counts: Mutex<BoundedMap<(Ecosystem, String), usize>>,
+    emitted_graph_cache: Mutex<BoundedMap<(Ecosystem, String), CachedEmittedGraphEvidence>>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +76,13 @@ struct ObservedPackageRecorder {
 }
 
 #[derive(Debug, Clone)]
+struct InlineObservedHydrator {
+    http: reqwest::Client,
+    allowed_ecosystems: HashSet<Ecosystem>,
+    concurrency_limit: Arc<Semaphore>,
+}
+
+#[derive(Debug, Clone)]
 struct PackageCensus {
     path: PathBuf,
     cache: Arc<Mutex<Option<PackageCensusCache>>>,
@@ -75,6 +92,7 @@ struct PackageCensus {
 struct PackageCensusCache {
     modified_at: Option<SystemTime>,
     packages: HashSet<(Ecosystem, String)>,
+    checked_at: std::time::Instant,
 }
 
 #[derive(Debug)]
@@ -83,7 +101,7 @@ struct OnlinePriorityFallback {
     v3_base: String,
     v3alpha_base: String,
     thresholds: HashMap<Ecosystem, FallbackThresholds>,
-    cache: Mutex<HashMap<(Ecosystem, String), PrioritySnapshot>>,
+    cache: Mutex<BoundedMap<(Ecosystem, String), PrioritySnapshot>>,
 }
 
 #[derive(Debug)]
@@ -109,6 +127,15 @@ struct LocalGraphCache {
 #[derive(Debug, Clone, Default)]
 struct LocalGraphEvidence {
     known: bool,
+    direct_dependencies_seen: usize,
+    reverse_dependents_seen: usize,
+    repository: Option<PackageRepositoryIdentity>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedEmittedGraphEvidence {
+    known_in_local_graph: bool,
+    known_in_census: bool,
     direct_dependencies_seen: usize,
     reverse_dependents_seen: usize,
     repository: Option<PackageRepositoryIdentity>,
@@ -430,7 +457,7 @@ impl PriorityResolver {
                 v3_base: config.deps_dev_v3_base.clone(),
                 v3alpha_base: config.deps_dev_v3alpha_base.clone(),
                 thresholds: thresholds.clone(),
-                cache: Mutex::new(HashMap::new()),
+                cache: Mutex::new(BoundedMap::new(MAX_ONLINE_FALLBACK_CACHE_ENTRIES)),
             })
         } else {
             None
@@ -451,6 +478,19 @@ impl PriorityResolver {
             path: config.census_file.clone(),
             cache: Arc::new(Mutex::new(None)),
         };
+        let inline_observed_hydrator = Some(InlineObservedHydrator {
+            http: reqwest::Client::builder()
+                .user_agent("supply-stream-inline-priority/0.1.0")
+                .http2_adaptive_window(true)
+                .connect_timeout(config.online_request_timeout.min(Duration::from_secs(3)))
+                .timeout(config.online_request_timeout.min(Duration::from_secs(5)))
+                .build()
+                .context("failed to build inline priority hydrate HTTP client")?,
+            allowed_ecosystems: [Ecosystem::Pypi, Ecosystem::Npm, Ecosystem::CratesIo]
+                .into_iter()
+                .collect(),
+            concurrency_limit: Arc::new(Semaphore::new(4)),
+        });
         let online_expander = if config.online_expand_unknown {
             Some(OnlinePriorityExpander {
                 graph_file: config.graph_file.clone(),
@@ -478,18 +518,19 @@ impl PriorityResolver {
                 },
                 package_census,
                 local_graph_fallback,
+                inline_observed_hydrator,
                 online_fallback,
                 online_expander,
-                observation_counts: Mutex::new(HashMap::new()),
+                observation_counts: Mutex::new(BoundedMap::new(MAX_OBSERVATION_COUNT_ENTRIES)),
+                emitted_graph_cache: Mutex::new(BoundedMap::new(
+                    MAX_EMITTED_GRAPH_EVIDENCE_CACHE_ENTRIES,
+                )),
             }),
         })
     }
 
     pub async fn apply(&self, mut event: PackageReleaseEvent) -> PackageReleaseEvent {
-        event.priority = Some(
-            self.resolve_observed_release(event.ecosystem, &event.package)
-                .await,
-        );
+        event.priority = Some(self.resolve_observed_event(&event).await);
         event
     }
 
@@ -562,7 +603,23 @@ impl PriorityResolver {
                 }
             }
         }
+        for package in &touched {
+            self.inner
+                .invalidate_emitted_graph_cache(capture.ecosystem, package)
+                .await;
+        }
         updates
+    }
+
+    pub async fn record_hydrated_release_metadata(
+        &self,
+        event: &PackageReleaseEvent,
+        capture: &CapturedRelease,
+    ) -> Result<Option<PrioritySnapshot>> {
+        let normalized = normalize_package_name(event.ecosystem, &event.package);
+        self.inner
+            .apply_hydrated_release_metadata(event, &normalized, capture)
+            .await
     }
 
     pub async fn resolve_observed_release(
@@ -653,6 +710,133 @@ impl PriorityResolver {
                 .spawn_expand(
                     Arc::clone(&self.inner),
                     ecosystem,
+                    normalized,
+                    snapshot.direct_popularity,
+                )
+                .await;
+        }
+        snapshot
+    }
+
+    pub async fn resolve_observed_event(&self, event: &PackageReleaseEvent) -> PrioritySnapshot {
+        let normalized = normalize_package_name(event.ecosystem, &event.package);
+        let observation_count = self
+            .inner
+            .record_observation(event.ecosystem, normalized.clone())
+            .await;
+        if let Some(snapshot) = self
+            .inner
+            .scores
+            .read()
+            .await
+            .get(&(event.ecosystem, normalized.clone()))
+            .cloned()
+            && (snapshot.source != PrioritySource::KnownPackageStub || observation_count < 2)
+        {
+            return snapshot;
+        }
+
+        if let Some(local_graph) = &self.inner.local_graph_fallback
+            && let Some(snapshot) = local_graph.resolve(event.ecosystem, &normalized).await
+        {
+            let snapshot = self
+                .inner
+                .remember_snapshot(event.ecosystem, normalized.clone(), snapshot)
+                .await;
+            if let Some(expander) = &self.inner.online_expander
+                && expander.should_expand(&snapshot, observation_count)
+            {
+                expander
+                    .spawn_expand(
+                        Arc::clone(&self.inner),
+                        event.ecosystem,
+                        normalized.clone(),
+                        snapshot.direct_popularity,
+                    )
+                    .await;
+            }
+            return snapshot;
+        }
+
+        if observation_count >= 2 {
+            match self
+                .inner
+                .inline_hydrate_observed_release(event, &normalized)
+                .await
+            {
+                Ok(Some(snapshot)) => {
+                    if let Some(expander) = &self.inner.online_expander
+                        && expander.should_expand(&snapshot, observation_count)
+                    {
+                        expander
+                            .spawn_expand(
+                                Arc::clone(&self.inner),
+                                event.ecosystem,
+                                normalized.clone(),
+                                snapshot.direct_popularity,
+                            )
+                            .await;
+                    }
+                    return snapshot;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    debug!(
+                        event_id = event.event_id,
+                        ecosystem = %event.ecosystem,
+                        package = event.package,
+                        error = %error,
+                        "inline priority metadata hydrate failed"
+                    );
+                }
+            }
+        }
+
+        if self
+            .inner
+            .package_census
+            .contains(event.ecosystem, &normalized)
+            .await
+            .unwrap_or(false)
+        {
+            let snapshot = self
+                .inner
+                .remember_snapshot(
+                    event.ecosystem,
+                    normalized.clone(),
+                    PrioritySnapshot::package_census(),
+                )
+                .await;
+            if let Some(expander) = &self.inner.online_expander
+                && expander.should_expand(&snapshot, observation_count)
+            {
+                expander
+                    .spawn_expand(
+                        Arc::clone(&self.inner),
+                        event.ecosystem,
+                        normalized.clone(),
+                        snapshot.direct_popularity,
+                    )
+                    .await;
+            }
+            return snapshot;
+        }
+
+        let snapshot = self
+            .inner
+            .remember_snapshot(
+                event.ecosystem,
+                normalized.clone(),
+                PrioritySnapshot::known_package_stub(),
+            )
+            .await;
+        if let Some(expander) = &self.inner.online_expander
+            && expander.should_expand(&snapshot, observation_count)
+        {
+            expander
+                .spawn_expand(
+                    Arc::clone(&self.inner),
+                    event.ecosystem,
                     normalized,
                     snapshot.direct_popularity,
                 )
@@ -769,14 +953,31 @@ impl PriorityResolver {
         package: &str,
     ) -> EmittedGraphEvidence {
         let normalized = normalize_package_name(ecosystem, package);
+        let key = (ecosystem, normalized.clone());
         let observed_count = self
             .inner
             .observation_counts
             .lock()
             .await
-            .get(&(ecosystem, normalized.clone()))
+            .get(&key)
             .copied()
             .unwrap_or(0);
+        if let Some(cached) = self
+            .inner
+            .emitted_graph_cache
+            .lock()
+            .await
+            .get_cloned_refresh(&key)
+        {
+            return EmittedGraphEvidence {
+                known_in_local_graph: cached.known_in_local_graph,
+                known_in_census: cached.known_in_census,
+                observed_count,
+                direct_dependencies_seen: cached.direct_dependencies_seen,
+                reverse_dependents_seen: cached.reverse_dependents_seen,
+                repository: cached.repository,
+            };
+        }
 
         let known_in_census = self
             .inner
@@ -793,22 +994,25 @@ impl PriorityResolver {
         } else {
             LocalGraphEvidence::default()
         };
-        let repository = if let Some(local_graph) = &self.inner.local_graph_fallback {
-            local_graph
-                .repository(ecosystem, &normalized)
-                .await
-                .unwrap_or(None)
-        } else {
-            None
-        };
-
-        EmittedGraphEvidence {
+        let cached = CachedEmittedGraphEvidence {
             known_in_local_graph: local_graph.known,
             known_in_census,
-            observed_count,
             direct_dependencies_seen: local_graph.direct_dependencies_seen,
             reverse_dependents_seen: local_graph.reverse_dependents_seen,
-            repository: repository.or(local_graph.repository),
+            repository: local_graph.repository.clone(),
+        };
+        self.inner
+            .emitted_graph_cache
+            .lock()
+            .await
+            .insert(key, cached.clone());
+        EmittedGraphEvidence {
+            known_in_local_graph: cached.known_in_local_graph,
+            known_in_census: cached.known_in_census,
+            observed_count,
+            direct_dependencies_seen: cached.direct_dependencies_seen,
+            reverse_dependents_seen: cached.reverse_dependents_seen,
+            repository: cached.repository,
         }
     }
 
@@ -860,11 +1064,23 @@ impl PriorityResolver {
 }
 
 impl PriorityResolverInner {
+    async fn invalidate_emitted_graph_cache(&self, ecosystem: Ecosystem, package: &str) {
+        self.emitted_graph_cache
+            .lock()
+            .await
+            .remove(&(ecosystem, normalize_package_name(ecosystem, package)));
+    }
+
     async fn record_observation(&self, ecosystem: Ecosystem, package: String) -> usize {
         let mut counts = self.observation_counts.lock().await;
-        let entry = counts.entry((ecosystem, package)).or_insert(0);
-        *entry += 1;
-        *entry
+        let key = (ecosystem, package);
+        if let Some(entry) = counts.get_mut(&key) {
+            *entry += 1;
+            *entry
+        } else {
+            counts.insert(key, 1);
+            1
+        }
     }
 
     async fn remember_snapshot(
@@ -885,12 +1101,118 @@ impl PriorityResolverInner {
         drop(scores);
 
         if persist {
-            self.observed_package_recorder
-                .persist_snapshot(ecosystem, package, snapshot.clone())
+            self.invalidate_emitted_graph_cache(ecosystem, &package)
                 .await;
+            if snapshot_requires_runtime_persistence(&snapshot) {
+                self.observed_package_recorder
+                    .persist_snapshot(ecosystem, package.clone(), snapshot.clone())
+                    .await;
+            }
+            self.package_census.remember(ecosystem, &package).await;
         }
 
         snapshot
+    }
+
+    async fn inline_hydrate_observed_release(
+        &self,
+        event: &PackageReleaseEvent,
+        normalized: &str,
+    ) -> Result<Option<PrioritySnapshot>> {
+        let Some(hydrator) = &self.inline_observed_hydrator else {
+            return Ok(None);
+        };
+        if self.local_graph_fallback.is_none() {
+            return Ok(None);
+        }
+
+        let Some(capture) = hydrator.hydrate(event).await? else {
+            return Ok(None);
+        };
+        self.apply_hydrated_release_metadata(event, normalized, &capture)
+            .await
+    }
+
+    async fn apply_hydrated_release_metadata(
+        &self,
+        event: &PackageReleaseEvent,
+        normalized: &str,
+        capture: &CapturedRelease,
+    ) -> Result<Option<PrioritySnapshot>> {
+        let graph_records = graph_records_from_captured_release(capture);
+        let repositories =
+            package_repository_identity_from_captured_release(event.ecosystem, capture)
+                .into_iter()
+                .collect::<Vec<_>>();
+        self.observed_package_recorder
+            .persist_graph_material(&graph_records, &repositories)
+            .await?;
+        self.package_census
+            .remember_from_score_input(&graph_records)
+            .await;
+        for package in touched_packages_from_score_input(&graph_records) {
+            self.invalidate_emitted_graph_cache(event.ecosystem, &package)
+                .await;
+        }
+
+        let Some(local_graph) = &self.local_graph_fallback else {
+            return Ok(None);
+        };
+
+        let roots = vec![normalized.to_string()];
+        let rescored = local_graph
+            .score_neighborhood(event.ecosystem, &roots, 32)
+            .await?;
+        for (package, snapshot) in &rescored {
+            let snapshot = if package == normalized {
+                apply_metadata_risk_override(snapshot.clone(), capture)
+            } else {
+                snapshot.clone()
+            };
+            self.remember_snapshot(event.ecosystem, package.clone(), snapshot)
+                .await;
+        }
+
+        if let Some(snapshot) = rescored.get(normalized).cloned() {
+            return Ok(Some(apply_metadata_risk_override(snapshot, capture)));
+        }
+
+        Ok(local_graph
+            .resolve(event.ecosystem, normalized)
+            .await
+            .map(|snapshot| apply_metadata_risk_override(snapshot, capture)))
+    }
+}
+
+fn touched_packages_from_score_input(records: &[scoring::ScoreInputRecord]) -> BTreeSet<String> {
+    let mut packages = BTreeSet::new();
+    for record in records {
+        match record {
+            scoring::ScoreInputRecord::Package { package, .. } => {
+                packages.insert(package.clone());
+            }
+            scoring::ScoreInputRecord::Dependency {
+                package,
+                dependency,
+                ..
+            } => {
+                packages.insert(package.clone());
+                packages.insert(dependency.clone());
+            }
+        }
+    }
+    packages
+}
+
+impl InlineObservedHydrator {
+    async fn hydrate(&self, event: &PackageReleaseEvent) -> Result<Option<CapturedRelease>> {
+        if !self.allowed_ecosystems.contains(&event.ecosystem) {
+            return Ok(None);
+        }
+        let Ok(_permit) = Arc::clone(&self.concurrency_limit).try_acquire_owned() else {
+            return Ok(None);
+        };
+        hydrate_release_metadata_for_priority(&self.http, event).await
     }
 }
 
@@ -928,6 +1250,27 @@ fn priority_tier_rank(tier: PriorityTier) -> u8 {
         PriorityTier::Medium => 1,
         PriorityTier::High => 2,
     }
+}
+
+fn apply_metadata_risk_override(
+    mut snapshot: PrioritySnapshot,
+    capture: &CapturedRelease,
+) -> PrioritySnapshot {
+    let metadata_risk = captured_metadata_risk(capture);
+    if !metadata_risk.suspicious {
+        return snapshot;
+    }
+
+    let override_tier = if metadata_risk.score >= 8 {
+        PriorityTier::High
+    } else {
+        PriorityTier::Medium
+    };
+    if priority_tier_rank(override_tier) > priority_tier_rank(snapshot.tier) {
+        snapshot.tier = override_tier;
+        snapshot.score_source_version = Some("local_graph_metadata_risk_v1".to_string());
+    }
+    snapshot
 }
 
 fn metric_or_zero(value: Option<f64>) -> f64 {
@@ -1323,24 +1666,28 @@ async fn load_priority_score_records_union(
 
 impl PackageCensus {
     async fn contains(&self, ecosystem: Ecosystem, package: &str) -> Result<bool> {
-        Ok(self
-            .load_cache()
-            .await?
-            .packages
-            .contains(&(ecosystem, package.to_string())))
-    }
+        let normalized = normalize_package_name(ecosystem, package);
+        let key = (ecosystem, normalized);
+        {
+            let mut guard = self.cache.lock().await;
+            if let Some(cache) = guard.as_mut()
+                && cache.checked_at.elapsed() < PACKAGE_CENSUS_REFRESH_INTERVAL
+            {
+                return Ok(cache.packages.contains(&key));
+            }
+        }
 
-    async fn load_cache(&self) -> Result<PackageCensusCache> {
         let modified_at = tokio::fs::metadata(&self.path)
             .await
             .ok()
             .and_then(|metadata| metadata.modified().ok());
         {
-            let guard = self.cache.lock().await;
-            if let Some(cache) = guard.as_ref()
+            let mut guard = self.cache.lock().await;
+            if let Some(cache) = guard.as_mut()
                 && cache.modified_at == modified_at
             {
-                return Ok(cache.clone());
+                cache.checked_at = Instant::now();
+                return Ok(cache.packages.contains(&key));
             }
         }
 
@@ -1354,12 +1701,45 @@ impl PackageCensus {
                 )
             })
             .collect::<HashSet<_>>();
+        let contains = packages.contains(&key);
         let cache = PackageCensusCache {
             modified_at,
             packages,
+            checked_at: Instant::now(),
         };
         *self.cache.lock().await = Some(cache.clone());
-        Ok(cache)
+        Ok(contains)
+    }
+
+    async fn remember(&self, ecosystem: Ecosystem, package: &str) {
+        let normalized = normalize_package_name(ecosystem, package);
+        let mut guard = self.cache.lock().await;
+        if let Some(cache) = guard.as_mut() {
+            cache.packages.insert((ecosystem, normalized));
+            cache.checked_at = Instant::now();
+        }
+    }
+
+    async fn remember_records(&self, records: &[PackageCensusRecord]) {
+        if records.is_empty() {
+            return;
+        }
+
+        let mut guard = self.cache.lock().await;
+        if let Some(cache) = guard.as_mut() {
+            for record in records {
+                cache.packages.insert((
+                    record.ecosystem,
+                    normalize_package_name(record.ecosystem, &record.package),
+                ));
+            }
+            cache.checked_at = Instant::now();
+        }
+    }
+
+    async fn remember_from_score_input(&self, records: &[scoring::ScoreInputRecord]) {
+        let census_records = package_census_from_score_input(records);
+        self.remember_records(&census_records).await;
     }
 }
 
@@ -1394,6 +1774,22 @@ impl ObservedPackageRecorder {
                 "failed to persist runtime priority snapshot"
             );
         }
+    }
+
+    async fn persist_graph_material(
+        &self,
+        records: &[scoring::ScoreInputRecord],
+        repositories: &[RepoPackageRepositoryIdentity],
+    ) -> Result<()> {
+        let _guard = self.update_lock.lock().await;
+        append_graph_material_records(
+            &self.graph_file,
+            &self.census_file,
+            self.graph_store_file.as_deref(),
+            records,
+            repositories,
+        )
+        .await
     }
 }
 
@@ -1455,10 +1851,94 @@ async fn append_snapshot_records(
     Ok(())
 }
 
+async fn append_graph_material_records(
+    graph_file: &Path,
+    census_file: &Path,
+    graph_store_file: Option<&Path>,
+    records: &[scoring::ScoreInputRecord],
+    repositories: &[RepoPackageRepositoryIdentity],
+) -> Result<()> {
+    if records.is_empty() && repositories.is_empty() {
+        return Ok(());
+    }
+
+    if !records.is_empty() {
+        append_ndjson_records(graph_file, records).await?;
+        let census_records = package_census_from_score_input(records);
+        append_ndjson_records(census_file, &census_records).await?;
+    }
+
+    if let Some(graph_store_file) = graph_store_file {
+        let store = OperationalStore::open(graph_store_file.to_path_buf()).await?;
+        if !records.is_empty() {
+            store.record_graph_records(records).await?;
+        }
+        if !repositories.is_empty() {
+            store.record_package_repository_refs(repositories).await?;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn merge_package_census_records(records: &[PackageCensusRecord]) -> Vec<PackageCensusRecord> {
+    let mut merged = BTreeMap::<(Ecosystem, String), PackageCensusRecord>::new();
+    for record in records {
+        let key = (
+            record.ecosystem,
+            normalize_package_name(record.ecosystem, &record.package),
+        );
+        match merged.get_mut(&key) {
+            Some(existing) => merge_package_census_record(existing, record),
+            None => {
+                let mut normalized = record.clone();
+                normalized.package = key.1.clone();
+                merged.insert(key, normalized);
+            }
+        }
+    }
+    merged.into_values().collect()
+}
+
+fn merge_package_census_record(target: &mut PackageCensusRecord, candidate: &PackageCensusRecord) {
+    let candidate_discovered_at = match (target.discovered_at, candidate.discovered_at) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (None, Some(right)) => Some(right),
+        (Some(left), None) => Some(left),
+        (None, None) => None,
+    };
+    target.discovered_at = candidate_discovered_at;
+
+    let target_rank = census_source_rank(target.source.as_deref());
+    let candidate_rank = census_source_rank(candidate.source.as_deref());
+    if candidate_rank > target_rank || (candidate_rank == target_rank && target.source.is_none()) {
+        target.source = candidate.source.clone();
+    }
+}
+
+fn census_source_rank(source: Option<&str>) -> u8 {
+    match source {
+        Some("pypi_simple_index") | Some("npm_all_docs") | Some("crates_io_native") => 5,
+        Some("graph_input") => 4,
+        Some("offline_score_file") | Some("local_graph") => 3,
+        Some("package_census") => 2,
+        Some("known_package_stub") | Some("runtime_observed_v1") => 1,
+        Some(_) => 2,
+        None => 0,
+    }
+}
+
 fn snapshot_persists_to_score_file(snapshot: &PrioritySnapshot) -> bool {
     matches!(
         snapshot.source,
         PrioritySource::LocalGraph | PrioritySource::OfflineScoreFile
+    )
+}
+
+fn snapshot_requires_runtime_persistence(snapshot: &PrioritySnapshot) -> bool {
+    !matches!(
+        snapshot.source,
+        PrioritySource::KnownPackageStub | PrioritySource::PackageCensus
     )
 }
 
@@ -1544,7 +2024,7 @@ fn roots_from_score_input(records: &[scoring::ScoreInputRecord]) -> Vec<(Ecosyst
 impl OnlinePriorityFallback {
     async fn resolve(&self, ecosystem: Ecosystem, package: &str) -> PrioritySnapshot {
         let key = (ecosystem, package.to_string());
-        if let Some(snapshot) = self.cache.lock().await.get(&key).cloned() {
+        if let Some(snapshot) = self.cache.lock().await.get_cloned_refresh(&key) {
             return snapshot;
         }
 
@@ -1682,6 +2162,9 @@ impl LocalGraphFallback {
                 repository: evidence.repository,
             });
         }
+        if self.store.is_some() {
+            return Ok(LocalGraphEvidence::default());
+        }
 
         let cache = self.load_cache().await?;
         let key = (ecosystem, package.to_string());
@@ -1722,6 +2205,9 @@ impl LocalGraphFallback {
 
         if let Some(evidence) = self.load_store_evidence(ecosystem, package).await? {
             return Ok(Some(self.snapshot_from_evidence(ecosystem, evidence)));
+        }
+        if self.store.is_some() {
+            return Ok(None);
         }
 
         let cache = self.load_cache().await?;
@@ -1832,6 +2318,9 @@ impl LocalGraphFallback {
                 reverse_dependents: neighborhood.reverse_dependents,
                 repository: neighborhood.evidence.repository,
             });
+        }
+        if self.store.is_some() {
+            return Ok(LocalGraphInspectionData::default());
         }
 
         let cache = self.load_cache().await?;
@@ -2013,9 +2502,7 @@ impl OnlinePriorityExpander {
         match snapshot.source {
             PrioritySource::OfflineScoreFile => false,
             PrioritySource::LocalGraph => {
-                snapshot.tier == PriorityTier::High
-                    || snapshot.tier == PriorityTier::Medium
-                    || observation_count >= self.min_observations
+                snapshot.tier == PriorityTier::High && observation_count >= self.min_observations
             }
             PrioritySource::DepsDevDependentsApi | PrioritySource::EcosysteMsCountsApi => {
                 snapshot.tier == PriorityTier::High || observation_count >= self.min_observations
@@ -3406,18 +3893,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolver_creates_known_package_stub_and_persists_only_census() {
-        let score_path = PathBuf::from(format!(
-            "/tmp/supply-stream-priority-stub-score-{}.ndjson",
-            std::process::id()
-        ));
-        let graph_path = PathBuf::from(format!(
-            "/tmp/supply-stream-priority-stub-graph-{}.ndjson",
-            std::process::id()
-        ));
-        let census_path = score_path.with_extension("census.ndjson");
+    async fn resolver_creates_known_package_stub_without_persisting_runtime_files() {
+        let temp = tempdir().unwrap();
+        let score_path = temp.path().join("priority-scores.ndjson");
+        let graph_path = temp.path().join("graph-input.ndjson");
+        let census_path = temp.path().join("package-census.ndjson");
         tokio::fs::write(&score_path, "").await.unwrap();
         tokio::fs::write(&graph_path, "").await.unwrap();
+        tokio::fs::write(&census_path, "").await.unwrap();
 
         let resolver = PriorityResolver::load(&PriorityConfig {
             score_file: score_path.clone(),
@@ -3469,15 +3952,16 @@ mod tests {
             .await;
         assert_eq!(second.source, PrioritySource::KnownPackageStub);
 
+        let emitted = resolver
+            .emitted_graph_evidence(Ecosystem::Npm, "@scope/new-package")
+            .await;
+        assert!(emitted.known_in_census);
+
         let score_body = tokio::fs::read_to_string(&score_path).await.unwrap();
         assert!(score_body.trim().is_empty());
 
         let census_body = tokio::fs::read_to_string(&census_path).await.unwrap();
-        assert!(census_body.contains("\"package\":\"@scope/new-package\""));
-
-        let _ = tokio::fs::remove_file(score_path).await;
-        let _ = tokio::fs::remove_file(graph_path).await;
-        let _ = tokio::fs::remove_file(census_path).await;
+        assert!(census_body.trim().is_empty());
     }
 
     #[tokio::test]
@@ -3617,6 +4101,417 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hydrated_metadata_drop_still_persists_graph_material() {
+        let temp = tempdir().unwrap();
+        let score_path = temp.path().join("priority-scores.ndjson");
+        let graph_path = temp.path().join("graph-input.ndjson");
+        let census_path = temp.path().join("package-census.ndjson");
+        tokio::fs::write(&score_path, "").await.unwrap();
+        tokio::fs::write(&graph_path, "").await.unwrap();
+        tokio::fs::write(&census_path, "").await.unwrap();
+
+        let resolver = PriorityResolver::load(&PriorityConfig {
+            score_file: score_path.clone(),
+            graph_file: graph_path.clone(),
+            graph_store_file: None,
+            census_file: census_path.clone(),
+            online_fallback: false,
+            online_expand_unknown: false,
+            online_expand_min_observations: 2,
+            online_request_timeout: std::time::Duration::from_secs(2),
+            deps_dev_v3_base: "https://api.deps.dev/v3".to_string(),
+            deps_dev_v3alpha_base: "https://api.deps.dev/v3alpha".to_string(),
+            expand_focus: crate::deps_dev::FocusDependentsConfig {
+                reverse_depth: 2,
+                max_frontier_packages: 1000,
+                include_non_highest_dependent_releases: false,
+                default_direct_popularity: 1.0,
+                direct_popularity_strategy:
+                    crate::deps_dev::DirectPopularityStrategy::DirectDependentCount,
+            },
+            expand_collect: crate::collector::CollectConfig {
+                max_depth: 1,
+                max_packages: 512,
+                request_concurrency: 16,
+                allow_external_fallback: true,
+            },
+            expand_score_build: crate::scoring::ScoreBuildConfig {
+                alpha: 0.85,
+                max_iterations: 64,
+                epsilon: 1e-6,
+                high_quantile: 0.99,
+                medium_quantile: 0.90,
+                score_source_version: Some("test_runtime_expand_v1".to_string()),
+            },
+        })
+        .await
+        .unwrap();
+
+        let event = PackageReleaseEvent {
+            event_id: "npm:pkg-drop@1.0.0".to_string(),
+            ecosystem: Ecosystem::Npm,
+            package: "pkg-drop".to_string(),
+            version: "1.0.0".to_string(),
+            published_at: None,
+            observed_at: Utc::now(),
+            source: "test".to_string(),
+            sequence: None,
+            package_url: None,
+            release_url: None,
+            metadata_url: None,
+            priority: Some(PrioritySnapshot::known_package_stub()),
+        };
+
+        resolver
+            .record_hydrated_release_metadata(
+                &event,
+                &crate::capture::CapturedRelease {
+                    event_id: event.event_id.clone(),
+                    ecosystem: Ecosystem::Npm,
+                    package: "pkg-drop".to_string(),
+                    version: "1.0.0".to_string(),
+                    observed_at: Utc::now(),
+                    published_at: None,
+                    captured_at: Utc::now(),
+                    status: crate::capture::ReleaseStatus::Active,
+                    package_url: None,
+                    release_url: None,
+                    metadata_url: None,
+                    raw_metadata_path: None,
+                    artifacts: Vec::new(),
+                    upstream_repository: None,
+                    details: serde_json::json!({
+                        "dependencies": ["dep-z"],
+                        "repository": "https://github.com/example/pkg-drop",
+                        "metadata_risk": {
+                            "suspicious": false,
+                            "score": 0,
+                            "factors": [],
+                            "reason": "clean"
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let package_evidence = resolver
+            .emitted_graph_evidence(Ecosystem::Npm, "pkg-drop")
+            .await;
+        assert!(package_evidence.known_in_local_graph);
+        assert_eq!(package_evidence.direct_dependencies_seen, 1);
+
+        let dependency_evidence = resolver
+            .emitted_graph_evidence(Ecosystem::Npm, "dep-z")
+            .await;
+        assert!(dependency_evidence.known_in_local_graph);
+        assert_eq!(dependency_evidence.reverse_dependents_seen, 1);
+
+        let graph_body = tokio::fs::read_to_string(&graph_path).await.unwrap();
+        assert!(graph_body.contains("\"package\":\"pkg-drop\""));
+        assert!(graph_body.contains("\"dependency\":\"dep-z\""));
+    }
+
+    #[tokio::test]
+    async fn apply_inline_hydrates_observed_release_into_local_graph() {
+        let temp = tempdir().unwrap();
+        let score_path = temp.path().join("priority-scores.ndjson");
+        let graph_path = temp.path().join("graph-input.ndjson");
+        let census_path = temp.path().join("package-census.ndjson");
+        let store_path = temp.path().join("index.sqlite");
+        tokio::fs::write(&score_path, "").await.unwrap();
+        tokio::fs::write(&graph_path, "").await.unwrap();
+        tokio::fs::write(&census_path, "").await.unwrap();
+
+        let metadata_url = serve_json_once(serde_json::json!({
+            "info": {
+                "requires_dist": ["dep-b>=1.0"],
+                "home_page": "https://github.com/acme/demo",
+                "project_urls": {
+                    "Source": "https://github.com/acme/demo"
+                }
+            },
+            "urls": [],
+            "last_serial": 42
+        }))
+        .await;
+
+        let resolver = PriorityResolver::load(&PriorityConfig {
+            score_file: score_path.clone(),
+            graph_file: graph_path.clone(),
+            graph_store_file: Some(store_path.clone()),
+            census_file: census_path.clone(),
+            online_fallback: false,
+            online_expand_unknown: false,
+            online_expand_min_observations: 2,
+            online_request_timeout: std::time::Duration::from_secs(2),
+            deps_dev_v3_base: "https://api.deps.dev/v3".to_string(),
+            deps_dev_v3alpha_base: "https://api.deps.dev/v3alpha".to_string(),
+            expand_focus: crate::deps_dev::FocusDependentsConfig {
+                reverse_depth: 2,
+                max_frontier_packages: 1000,
+                include_non_highest_dependent_releases: false,
+                default_direct_popularity: 1.0,
+                direct_popularity_strategy:
+                    crate::deps_dev::DirectPopularityStrategy::DirectDependentCount,
+            },
+            expand_collect: crate::collector::CollectConfig {
+                max_depth: 1,
+                max_packages: 512,
+                request_concurrency: 16,
+                allow_external_fallback: true,
+            },
+            expand_score_build: crate::scoring::ScoreBuildConfig {
+                alpha: 0.85,
+                max_iterations: 64,
+                epsilon: 1e-6,
+                high_quantile: 0.99,
+                medium_quantile: 0.90,
+                score_source_version: Some("test_runtime_expand_v1".to_string()),
+            },
+        })
+        .await
+        .unwrap();
+
+        let event = PackageReleaseEvent {
+            event_id: "pypi:demo@1.2.3".to_string(),
+            ecosystem: Ecosystem::Pypi,
+            package: "demo".to_string(),
+            version: "1.2.3".to_string(),
+            published_at: None,
+            observed_at: Utc::now(),
+            source: "test".to_string(),
+            sequence: None,
+            package_url: None,
+            release_url: None,
+            metadata_url: Some(metadata_url),
+            priority: None,
+        };
+
+        let first = resolver.apply(event.clone()).await;
+        assert_eq!(
+            first.priority_snapshot().source,
+            PrioritySource::KnownPackageStub
+        );
+
+        let resolved = resolver.apply(event).await;
+        let snapshot = resolved.priority_snapshot();
+        assert_eq!(snapshot.source, PrioritySource::LocalGraph);
+
+        let inspection = resolver
+            .inspect_local_graph(Ecosystem::Pypi, "demo", 10)
+            .await
+            .unwrap();
+        assert!(inspection.known_in_local_graph);
+        assert_eq!(inspection.direct_dependencies_seen, 1);
+        assert_eq!(
+            inspection
+                .repository
+                .as_ref()
+                .map(|repository| repository.normalized_repository_url.as_str()),
+            Some("https://github.com/acme/demo")
+        );
+
+        let store = OperationalStore::open(store_path).await.unwrap();
+        let repository = store
+            .load_package_repository_identity(Ecosystem::Pypi, "demo")
+            .await
+            .unwrap();
+        assert!(repository.is_some());
+    }
+
+    #[tokio::test]
+    async fn apply_inline_hydrate_supports_npm_event_time_local_graph() {
+        let temp = tempdir().unwrap();
+        let score_path = temp.path().join("priority-scores.ndjson");
+        let graph_path = temp.path().join("graph-input.ndjson");
+        let census_path = temp.path().join("package-census.ndjson");
+        let store_path = temp.path().join("index.sqlite");
+        tokio::fs::write(&score_path, "").await.unwrap();
+        tokio::fs::write(&graph_path, "").await.unwrap();
+        tokio::fs::write(&census_path, "").await.unwrap();
+
+        let metadata_url = serve_json_once(serde_json::json!({
+            "name": "demo",
+            "version": "1.2.3",
+            "repository": "https://github.com/acme/demo",
+            "dependencies": {
+                "dep-b": "^1.0.0"
+            }
+        }))
+        .await;
+
+        let resolver = PriorityResolver::load(&PriorityConfig {
+            score_file: score_path,
+            graph_file: graph_path,
+            graph_store_file: Some(store_path.clone()),
+            census_file: census_path,
+            online_fallback: false,
+            online_expand_unknown: false,
+            online_expand_min_observations: 2,
+            online_request_timeout: std::time::Duration::from_secs(2),
+            deps_dev_v3_base: "https://api.deps.dev/v3".to_string(),
+            deps_dev_v3alpha_base: "https://api.deps.dev/v3alpha".to_string(),
+            expand_focus: crate::deps_dev::FocusDependentsConfig {
+                reverse_depth: 2,
+                max_frontier_packages: 1000,
+                include_non_highest_dependent_releases: false,
+                default_direct_popularity: 1.0,
+                direct_popularity_strategy:
+                    crate::deps_dev::DirectPopularityStrategy::DirectDependentCount,
+            },
+            expand_collect: crate::collector::CollectConfig {
+                max_depth: 1,
+                max_packages: 512,
+                request_concurrency: 16,
+                allow_external_fallback: true,
+            },
+            expand_score_build: crate::scoring::ScoreBuildConfig {
+                alpha: 0.85,
+                max_iterations: 64,
+                epsilon: 1e-6,
+                high_quantile: 0.99,
+                medium_quantile: 0.90,
+                score_source_version: Some("test_runtime_expand_v1".to_string()),
+            },
+        })
+        .await
+        .unwrap();
+
+        let event = PackageReleaseEvent {
+            event_id: "npm:demo@1.2.3".to_string(),
+            ecosystem: Ecosystem::Npm,
+            package: "demo".to_string(),
+            version: "1.2.3".to_string(),
+            published_at: None,
+            observed_at: Utc::now(),
+            source: "test".to_string(),
+            sequence: None,
+            package_url: None,
+            release_url: None,
+            metadata_url: Some(metadata_url),
+            priority: None,
+        };
+
+        let first = resolver.apply(event.clone()).await;
+        assert_eq!(
+            first.priority_snapshot().source,
+            PrioritySource::KnownPackageStub
+        );
+
+        let resolved = resolver.apply(event).await;
+        assert_eq!(
+            resolved.priority_snapshot().source,
+            PrioritySource::LocalGraph
+        );
+
+        let store = OperationalStore::open(store_path).await.unwrap();
+        let inspection = store
+            .load_graph_evidence(Ecosystem::Npm, "demo")
+            .await
+            .unwrap();
+        assert!(inspection.is_some());
+    }
+
+    #[tokio::test]
+    async fn apply_inline_hydrate_escalates_malware_shaped_npm_metadata() {
+        let temp = tempdir().unwrap();
+        let score_path = temp.path().join("priority-scores.ndjson");
+        let graph_path = temp.path().join("graph-input.ndjson");
+        let census_path = temp.path().join("package-census.ndjson");
+        let store_path = temp.path().join("index.sqlite");
+        tokio::fs::write(&score_path, "").await.unwrap();
+        tokio::fs::write(&graph_path, "").await.unwrap();
+        tokio::fs::write(&census_path, "").await.unwrap();
+
+        let metadata_url = serve_json_once(serde_json::json!({
+            "name": "undicy-http",
+            "version": "2.0.0",
+            "main": "index.js",
+            "bin": "index.js",
+            "pkg": {"targets": ["node20-win-x64"]},
+            "dependencies": {
+                "@primno/dpapi": "^2.0.1",
+                "adm-zip": "^0.5.16",
+                "archiver": "^7.0.1",
+                "koffi": "^2.15.2",
+                "rcedit": "^4.0.1",
+                "screenshot-desktop": "^1.15.3",
+                "sqlite3": "^5.1.7",
+                "ws": "^8.18.2"
+            }
+        }))
+        .await;
+
+        let resolver = PriorityResolver::load(&PriorityConfig {
+            score_file: score_path,
+            graph_file: graph_path,
+            graph_store_file: Some(store_path),
+            census_file: census_path,
+            online_fallback: false,
+            online_expand_unknown: false,
+            online_expand_min_observations: 2,
+            online_request_timeout: std::time::Duration::from_secs(2),
+            deps_dev_v3_base: "https://api.deps.dev/v3".to_string(),
+            deps_dev_v3alpha_base: "https://api.deps.dev/v3alpha".to_string(),
+            expand_focus: crate::deps_dev::FocusDependentsConfig {
+                reverse_depth: 2,
+                max_frontier_packages: 1000,
+                include_non_highest_dependent_releases: false,
+                default_direct_popularity: 1.0,
+                direct_popularity_strategy:
+                    crate::deps_dev::DirectPopularityStrategy::DirectDependentCount,
+            },
+            expand_collect: crate::collector::CollectConfig {
+                max_depth: 1,
+                max_packages: 512,
+                request_concurrency: 16,
+                allow_external_fallback: true,
+            },
+            expand_score_build: crate::scoring::ScoreBuildConfig {
+                alpha: 0.85,
+                max_iterations: 64,
+                epsilon: 1e-6,
+                high_quantile: 0.99,
+                medium_quantile: 0.90,
+                score_source_version: Some("test_runtime_expand_v1".to_string()),
+            },
+        })
+        .await
+        .unwrap();
+
+        let event = PackageReleaseEvent {
+            event_id: "npm:undicy-http@2.0.0".to_string(),
+            ecosystem: Ecosystem::Npm,
+            package: "undicy-http".to_string(),
+            version: "2.0.0".to_string(),
+            published_at: None,
+            observed_at: Utc::now(),
+            source: "test".to_string(),
+            sequence: None,
+            package_url: None,
+            release_url: None,
+            metadata_url: Some(metadata_url),
+            priority: None,
+        };
+
+        let first = resolver.apply(event.clone()).await;
+        assert_eq!(
+            first.priority_snapshot().source,
+            PrioritySource::KnownPackageStub
+        );
+
+        let resolved = resolver.apply(event).await;
+        let snapshot = resolved.priority_snapshot();
+        assert_eq!(snapshot.source, PrioritySource::LocalGraph);
+        assert_eq!(snapshot.tier, PriorityTier::High);
+        assert!(snapshot.capture_requested());
+        assert!(snapshot.diff_requested());
+    }
+
+    #[tokio::test]
     async fn resolver_uses_package_census_before_network_fallback() {
         let score_path = PathBuf::from(format!(
             "/tmp/supply-stream-priority-census-score-{}.ndjson",
@@ -3685,6 +4580,80 @@ mod tests {
         let _ = tokio::fs::remove_file(census_path).await;
     }
 
+    #[tokio::test]
+    async fn emitted_graph_evidence_cache_keeps_observation_count_fresh() {
+        let temp = tempdir().unwrap();
+        let score_path = temp.path().join("priority-scores.ndjson");
+        let graph_path = temp.path().join("graph-input.ndjson");
+        let census_path = temp.path().join("package-census.ndjson");
+        tokio::fs::write(&score_path, "").await.unwrap();
+        tokio::fs::write(
+            &graph_path,
+            "{\"ecosystem\":\"npm\",\"package\":\"pkg-a\",\"direct_popularity\":1.0}\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(&census_path, "").await.unwrap();
+
+        let resolver = PriorityResolver::load(&PriorityConfig {
+            score_file: score_path.clone(),
+            graph_file: graph_path.clone(),
+            census_file: census_path.clone(),
+            graph_store_file: None,
+            online_fallback: false,
+            online_expand_unknown: false,
+            online_expand_min_observations: 2,
+            online_request_timeout: Duration::from_secs(1),
+            deps_dev_v3_base: "http://127.0.0.1".to_string(),
+            deps_dev_v3alpha_base: "http://127.0.0.1".to_string(),
+            expand_focus: crate::deps_dev::FocusDependentsConfig {
+                reverse_depth: 1,
+                max_frontier_packages: 64,
+                include_non_highest_dependent_releases: false,
+                default_direct_popularity: 1.0,
+                direct_popularity_strategy:
+                    crate::deps_dev::DirectPopularityStrategy::DirectDependentCount,
+            },
+            expand_collect: crate::collector::CollectConfig {
+                max_depth: 1,
+                max_packages: 64,
+                request_concurrency: 4,
+                allow_external_fallback: false,
+            },
+            expand_score_build: crate::scoring::ScoreBuildConfig {
+                alpha: 0.85,
+                max_iterations: 32,
+                epsilon: 1e-6,
+                high_quantile: 0.99,
+                medium_quantile: 0.9,
+                score_source_version: Some("test".to_string()),
+            },
+        })
+        .await
+        .unwrap();
+
+        resolver
+            .resolve_observed_release(Ecosystem::Npm, "pkg-a")
+            .await;
+        let first = resolver
+            .emitted_graph_evidence(Ecosystem::Npm, "pkg-a")
+            .await;
+        assert_eq!(first.observed_count, 1);
+
+        resolver
+            .resolve_observed_release(Ecosystem::Npm, "pkg-a")
+            .await;
+        let second = resolver
+            .emitted_graph_evidence(Ecosystem::Npm, "pkg-a")
+            .await;
+        assert_eq!(second.observed_count, 2);
+        assert_eq!(second.known_in_local_graph, first.known_in_local_graph);
+        assert_eq!(
+            second.direct_dependencies_seen,
+            first.direct_dependencies_seen
+        );
+    }
+
     #[test]
     fn ecosyste_ms_counts_snapshot_uses_repo_count_for_broader_impact() {
         let snapshot = priority_snapshot_from_ecosyste_ms_counts(116, Some(482), None);
@@ -3704,5 +4673,53 @@ mod tests {
         let ecosyste_ms = priority_snapshot_from_ecosyste_ms_counts(2, Some(3), None);
         assert_eq!(ecosyste_ms.source, PrioritySource::EcosysteMsCountsApi);
         assert_eq!(ecosyste_ms.tier, PriorityTier::Low);
+    }
+
+    #[test]
+    fn merge_package_census_records_prefers_native_sources() {
+        let merged = merge_package_census_records(&[
+            PackageCensusRecord {
+                ecosystem: Ecosystem::Npm,
+                package: "@scope/pkg".to_string(),
+                discovered_at: None,
+                source: Some("graph_input".to_string()),
+            },
+            PackageCensusRecord {
+                ecosystem: Ecosystem::Npm,
+                package: "@scope/pkg".to_string(),
+                discovered_at: None,
+                source: Some("npm_all_docs".to_string()),
+            },
+            PackageCensusRecord {
+                ecosystem: Ecosystem::Npm,
+                package: "@scope/pkg".to_string(),
+                discovered_at: Some(Utc::now()),
+                source: Some("known_package_stub".to_string()),
+            },
+        ]);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].package, "@scope/pkg");
+        assert_eq!(merged[0].source.as_deref(), Some("npm_all_docs"));
+    }
+
+    async fn serve_json_once(body: Value) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = serde_json::to_string(&body).unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        format!("http://{addr}/metadata.json")
     }
 }

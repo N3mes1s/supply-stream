@@ -8,6 +8,7 @@ use supply_stream_core::{
     config::PriorityConfig,
     deps_dev::{self, DirectPopularityStrategy, FocusDependentsConfig, ImportDependentsConfig},
     deps_dev_bigquery,
+    event::Ecosystem,
     priority::{self, PackageCensusRecord, PriorityScoreMetric},
     scoring::{self, ScoreBuildConfig},
 };
@@ -509,14 +510,41 @@ pub async fn run(args: PriorityArgs) -> Result<()> {
             output,
             base_input,
             npm_page_size,
+            npm_start_key,
             npm_limit,
             pypi_limit,
             crates_page_size,
+            crates_start_page,
             crates_limit,
             timeout_secs,
             json,
         } => {
             let mut records = Vec::<PackageCensusRecord>::new();
+            if tokio::fs::try_exists(&output).await.unwrap_or(false) {
+                records.extend(priority::load_package_census_records(&output).await?);
+            }
+            let effective_npm_start_key = npm_start_key.or_else(|| {
+                records
+                    .iter()
+                    .filter(|record| {
+                        record.ecosystem == Ecosystem::Npm
+                            && record.source.as_deref() == Some("npm_all_docs")
+                    })
+                    .map(|record| record.package.clone())
+                    .max()
+            });
+            let effective_crates_start_page = if crates_start_page > 1 {
+                crates_start_page
+            } else {
+                let existing_native_crates = records
+                    .iter()
+                    .filter(|record| {
+                        record.ecosystem == Ecosystem::CratesIo
+                            && record.source.as_deref() == Some("crates_io_native")
+                    })
+                    .count();
+                (existing_native_crates / crates_page_size.max(1)) + 1
+            };
             for input in base_input {
                 let score_input = scoring::load_score_input_records(&input).await?;
                 records.extend(priority::package_census_from_score_input(&score_input));
@@ -529,18 +557,17 @@ pub async fn run(args: PriorityArgs) -> Result<()> {
                     crates_io_base: "https://crates.io".to_string(),
                     request_timeout: Duration::from_secs(timeout_secs),
                     npm_page_size,
+                    npm_start_key: effective_npm_start_key.clone(),
                     npm_limit,
                     pypi_limit,
                     crates_page_size,
+                    crates_start_page: effective_crates_start_page,
                     crates_limit,
                 },
             )
             .await?;
             records.extend(live_records);
-            records.sort();
-            records.dedup_by(|left, right| {
-                left.ecosystem == right.ecosystem && left.package == right.package
-            });
+            records = priority::merge_package_census_records(&records);
             priority::write_package_census_records(&output, &records).await?;
 
             if json {
@@ -548,6 +575,8 @@ pub async fn run(args: PriorityArgs) -> Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "output": output.display().to_string(),
+                        "npm_start_key": effective_npm_start_key,
+                        "crates_start_page": effective_crates_start_page,
                         "summary": summary,
                         "emitted_records": records.len(),
                     }))?
@@ -570,6 +599,8 @@ pub async fn run(args: PriorityArgs) -> Result<()> {
             output,
             progress_file,
             batch_size,
+            recent_stub_hours,
+            recent_stub_limit,
             iterations,
             cursor,
             max_depth,
@@ -593,6 +624,8 @@ pub async fn run(args: PriorityArgs) -> Result<()> {
                 output,
                 progress_file,
                 batch_size,
+                recent_stub_hours,
+                recent_stub_limit,
                 iterations,
                 cursor,
                 max_depth,
@@ -1089,6 +1122,8 @@ struct BroadenCommand {
     output: Option<std::path::PathBuf>,
     progress_file: std::path::PathBuf,
     batch_size: usize,
+    recent_stub_hours: u64,
+    recent_stub_limit: usize,
     iterations: usize,
     cursor: Option<usize>,
     max_depth: usize,
@@ -1123,6 +1158,8 @@ struct BroadenSummary {
     census_size: usize,
     known_packages_source: &'static str,
     known_packages_count: usize,
+    hot_stub_candidates: usize,
+    hot_stub_selected: usize,
     scanned: usize,
     selected: usize,
     exhausted: bool,
@@ -1897,15 +1934,38 @@ async fn run_broaden_command(command: BroadenCommand) -> Result<()> {
     let mut total_incremental_score_updates = 0usize;
     let mut total_selected = 0usize;
     let mut total_scanned = 0usize;
+    let mut total_hot_stub_selected = 0usize;
     let mut exhausted = false;
     let mut iterations_completed = 0usize;
     let mut current_cursor = cursor_before;
+    let hot_stub_candidates = if command.recent_stub_limit == 0 || command.recent_stub_hours == 0 {
+        Vec::new()
+    } else {
+        let lookback_since =
+            chrono::Utc::now() - chrono::Duration::hours(command.recent_stub_hours as i64);
+        store
+            .load_hot_stub_packages(
+                &allowed_ecosystems.iter().copied().collect::<Vec<_>>(),
+                lookback_since,
+                command.recent_stub_limit,
+            )
+            .await?
+            .into_iter()
+            .map(|record| collector::SeedPackageRecord {
+                ecosystem: record.ecosystem,
+                package: record.package,
+                direct_popularity: Some(record.observations as f64),
+            })
+            .collect::<Vec<_>>()
+    };
+    let hot_stub_candidates_count = hot_stub_candidates.len();
 
     for _ in 0..command.iterations.max(1) {
         let known_packages = store
             .load_known_graph_packages(&allowed_ecosystems.iter().copied().collect::<Vec<_>>())
             .await?;
         let selection = select_broaden_batch(
+            &hot_stub_candidates,
             &ordered_census,
             &known_packages,
             current_cursor,
@@ -1914,6 +1974,7 @@ async fn run_broaden_command(command: BroadenCommand) -> Result<()> {
         current_cursor = selection.cursor_after;
         total_selected += selection.selected.len();
         total_scanned += selection.scanned;
+        total_hot_stub_selected += selection.hot_stub_selected;
         exhausted = selection.exhausted;
         iterations_completed += 1;
 
@@ -2088,6 +2149,8 @@ async fn run_broaden_command(command: BroadenCommand) -> Result<()> {
         census_size: ordered_census.len(),
         known_packages_source: "graph_store",
         known_packages_count: final_known_packages.len(),
+        hot_stub_candidates: hot_stub_candidates_count,
+        hot_stub_selected: total_hot_stub_selected,
         scanned: total_scanned,
         selected: total_selected,
         exhausted,
@@ -2108,10 +2171,12 @@ async fn run_broaden_command(command: BroadenCommand) -> Result<()> {
         println!("graph_store: {}", command.graph_store_file.display());
         println!("progress: {}", command.progress_file.display());
         println!(
-            "broadened: iterations={}/{} selected={} scanned={} cursor={} exhausted={} known_packages={} known_source={}",
+            "broadened: iterations={}/{} selected={} hot_stub_selected={} hot_stub_candidates={} scanned={} cursor={} exhausted={} known_packages={} known_source={}",
             summary.iterations_completed,
             summary.iterations_requested,
             summary.total_selected,
+            summary.hot_stub_selected,
+            summary.hot_stub_candidates,
             summary.total_scanned,
             summary.cursor_after,
             summary.exhausted,
@@ -2895,6 +2960,7 @@ struct BroadenSelection {
     selected: Vec<collector::SeedPackageRecord>,
     cursor_after: usize,
     scanned: usize,
+    hot_stub_selected: usize,
     exhausted: bool,
 }
 
@@ -3348,6 +3414,7 @@ async fn discover_reverse_dependents_from_census(
 }
 
 fn select_broaden_batch(
+    hot_stub_candidates: &[collector::SeedPackageRecord],
     census: &[collector::SeedPackageRecord],
     known_packages: &std::collections::BTreeSet<(supply_stream_core::event::Ecosystem, String)>,
     cursor: usize,
@@ -3355,11 +3422,28 @@ fn select_broaden_batch(
 ) -> BroadenSelection {
     let mut selected = Vec::new();
     let mut scanned = 0usize;
+    let mut hot_stub_selected = 0usize;
+    let mut selected_keys = std::collections::BTreeSet::new();
+
+    for record in hot_stub_candidates {
+        if selected.len() >= batch_size {
+            break;
+        }
+        scanned += 1;
+        let key = (record.ecosystem, record.package.clone());
+        if known_packages.contains(&key) || !selected_keys.insert(key) {
+            continue;
+        }
+        selected.push(record.clone());
+        hot_stub_selected += 1;
+    }
+
     let mut index = cursor.min(census.len());
     while index < census.len() && selected.len() < batch_size {
         let record = &census[index];
         scanned += 1;
-        if !known_packages.contains(&(record.ecosystem, record.package.clone())) {
+        let key = (record.ecosystem, record.package.clone());
+        if !known_packages.contains(&key) && selected_keys.insert(key) {
             selected.push(record.clone());
         }
         index += 1;
@@ -3368,6 +3452,7 @@ fn select_broaden_batch(
         selected,
         cursor_after: index,
         scanned,
+        hot_stub_selected,
         exhausted: index >= census.len(),
     }
 }
@@ -3427,13 +3512,41 @@ mod tests {
             },
         ];
         let known = std::collections::BTreeSet::from([(Ecosystem::Npm, "known-a".to_string())]);
-        let selection = select_broaden_batch(&census, &known, 0, 2);
+        let selection = select_broaden_batch(&[], &census, &known, 0, 2);
         assert_eq!(selection.scanned, 3);
         assert_eq!(selection.cursor_after, 3);
         assert!(selection.exhausted);
         assert_eq!(selection.selected.len(), 2);
+        assert_eq!(selection.hot_stub_selected, 0);
         assert_eq!(selection.selected[0].package, "new-b");
         assert_eq!(selection.selected[1].package, "new-c");
+    }
+
+    #[test]
+    fn select_broaden_batch_prioritizes_hot_stubs_before_census() {
+        let hot_stubs = vec![collector::SeedPackageRecord {
+            ecosystem: Ecosystem::Npm,
+            package: "hot-a".to_string(),
+            direct_popularity: Some(4.0),
+        }];
+        let census = vec![
+            collector::SeedPackageRecord {
+                ecosystem: Ecosystem::Npm,
+                package: "hot-a".to_string(),
+                direct_popularity: None,
+            },
+            collector::SeedPackageRecord {
+                ecosystem: Ecosystem::Npm,
+                package: "new-b".to_string(),
+                direct_popularity: None,
+            },
+        ];
+        let known = std::collections::BTreeSet::new();
+        let selection = select_broaden_batch(&hot_stubs, &census, &known, 0, 2);
+        assert_eq!(selection.selected.len(), 2);
+        assert_eq!(selection.hot_stub_selected, 1);
+        assert_eq!(selection.selected[0].package, "hot-a");
+        assert_eq!(selection.selected[1].package, "new-b");
     }
 
     #[test]

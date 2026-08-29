@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 
 use flate2::read::GzDecoder;
-use sha2::{Digest, Sha256};
 use tar::Archive;
 use zip::ZipArchive;
 
@@ -26,7 +25,6 @@ const MODULE_ECOSYSTEM: &[u8] = b"pypi";
 struct ArchiveFile {
     path: String,
     size_bytes: u64,
-    sha256: String,
     text_content: Option<String>,
 }
 
@@ -293,7 +291,6 @@ fn main(data: &[u8], _meta: Option<&[u8]>) -> Result<Pypi, ModuleError> {
         pypi_file.set_is_root(true);
         pypi_file.set_is_text(file.text_content.is_some());
         pypi_file.set_size_bytes(file.size_bytes);
-        pypi_file.set_sha256(file.sha256.clone());
         if should_expose_file_content(role) && let Some(content) = &file.text_content {
             pypi_file.set_content(content.clone());
         }
@@ -470,7 +467,6 @@ fn extract_zip_entries(data: &[u8]) -> Option<BTreeMap<String, ArchiveFile>> {
         if entry.read_to_end(&mut bytes).is_err() {
             return None;
         }
-        let sha256 = format!("{:x}", Sha256::digest(&bytes));
         let text_content = if should_buffer_manifest_text(&path, bytes.len()) && looks_like_text(&bytes)
         {
             String::from_utf8(bytes.clone()).ok()
@@ -482,7 +478,6 @@ fn extract_zip_entries(data: &[u8]) -> Option<BTreeMap<String, ArchiveFile>> {
             ArchiveFile {
                 path,
                 size_bytes: bytes.len() as u64,
-                sha256,
                 text_content,
             },
         );
@@ -507,7 +502,6 @@ fn extract_tar_entries(data: &[u8]) -> Option<BTreeMap<String, ArchiveFile>> {
         if entry.read_to_end(&mut bytes).is_err() {
             return None;
         }
-        let sha256 = format!("{:x}", Sha256::digest(&bytes));
         let text_content = if should_buffer_manifest_text(&path, bytes.len()) && looks_like_text(&bytes)
         {
             String::from_utf8(bytes.clone()).ok()
@@ -519,7 +513,6 @@ fn extract_tar_entries(data: &[u8]) -> Option<BTreeMap<String, ArchiveFile>> {
             ArchiveFile {
                 path,
                 size_bytes: bytes.len() as u64,
-                sha256,
                 text_content,
             },
         );
@@ -1063,8 +1056,33 @@ fn looks_like_text(bytes: &[u8]) -> bool {
     !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
 }
 
+/// ASCII case-insensitive substring search without allocating a lowercased
+/// copy of the haystack. Callers pass an already-lowercased needle; matching
+/// is case-insensitive on both sides either way.
 fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
-    haystack.to_ascii_lowercase().contains(needle)
+    let needle = needle.as_bytes();
+    let Some(&first) = needle.first() else {
+        return true;
+    };
+    let haystack = haystack.as_bytes();
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    let lower = first.to_ascii_lowercase();
+    let upper = first.to_ascii_uppercase();
+    let mut base = 0usize;
+    let limit = haystack.len() - needle.len();
+    while base <= limit {
+        let Some(offset) = memchr::memchr2(lower, upper, &haystack[base..=limit]) else {
+            return false;
+        };
+        let start = base + offset;
+        if haystack[start..start + needle.len()].eq_ignore_ascii_case(needle) {
+            return true;
+        }
+        base = start + 1;
+    }
+    false
 }
 
 fn find_file<'a>(pypi: &'a Pypi, path: &str) -> Option<&'a PypiFile> {

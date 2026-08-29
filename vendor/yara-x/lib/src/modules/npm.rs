@@ -12,7 +12,6 @@ use std::sync::LazyLock;
 use flate2::read::GzDecoder;
 use regex::Regex;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tar::Archive;
 
 use crate::modules::prelude::*;
@@ -56,7 +55,6 @@ static LOCAL_EXECUTABLE_LITERAL_RE: LazyLock<Regex> = LazyLock::new(|| {
 struct ArchiveFile {
     path: String,
     size_bytes: u64,
-    sha256: String,
     text_content: Option<String>,
     is_vendored: bool,
 }
@@ -280,7 +278,6 @@ fn main(data: &[u8], _meta: Option<&[u8]>) -> Result<Npm, ModuleError> {
         npm_file.set_is_vendored(file.is_vendored);
         npm_file.set_is_text(file.text_content.is_some());
         npm_file.set_size_bytes(file.size_bytes);
-        npm_file.set_sha256(file.sha256.clone());
         if should_expose_file_content(role, file) && let Some(content) = &file.text_content {
             npm_file.set_content(content.clone());
         }
@@ -484,7 +481,6 @@ fn extract_archive_entries(data: &[u8]) -> Option<BTreeMap<String, ArchiveFile>>
         if entry.read_to_end(&mut bytes).is_err() {
             return None;
         }
-        let sha256 = format!("{:x}", Sha256::digest(&bytes));
         let is_vendored = is_vendored_path(&path);
         let text_content = if !is_vendored
             && path.ends_with("package.json")
@@ -500,7 +496,6 @@ fn extract_archive_entries(data: &[u8]) -> Option<BTreeMap<String, ArchiveFile>>
             ArchiveFile {
                 path,
                 size_bytes: bytes.len() as u64,
-                sha256,
                 text_content,
                 is_vendored,
             },
@@ -1119,8 +1114,33 @@ fn looks_like_text(bytes: &[u8]) -> bool {
     !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
 }
 
+/// ASCII case-insensitive substring search without allocating a lowercased
+/// copy of the haystack. Callers pass an already-lowercased needle; matching
+/// is case-insensitive on both sides either way.
 fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
-    haystack.to_ascii_lowercase().contains(needle)
+    let needle = needle.as_bytes();
+    let Some(&first) = needle.first() else {
+        return true;
+    };
+    let haystack = haystack.as_bytes();
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    let lower = first.to_ascii_lowercase();
+    let upper = first.to_ascii_uppercase();
+    let mut base = 0usize;
+    let limit = haystack.len() - needle.len();
+    while base <= limit {
+        let Some(offset) = memchr::memchr2(lower, upper, &haystack[base..=limit]) else {
+            return false;
+        };
+        let start = base + offset;
+        if haystack[start..start + needle.len()].eq_ignore_ascii_case(needle) {
+            return true;
+        }
+        base = start + 1;
+    }
+    false
 }
 
 fn find_script<'a>(npm: &'a Npm, stage: &str) -> Option<&'a Script> {

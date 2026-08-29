@@ -13,6 +13,10 @@
 vendor/yara-x/lib/src/modules/**/*.zip
 vendor/yara-x/lib/src/modules/**/*.out
 
+# Build output of the vendored workspace (it is excluded from ours, so the
+# root /target rule does not cover it)
+vendor/yara-x/target/
+
 # Local operator watch loops (ad-hoc, stateful; see scripts/stream-check.sh for
 # the durable equivalent)
 scripts/watch-stream-summary.sh

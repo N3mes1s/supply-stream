@@ -1388,6 +1388,8 @@ pub struct Npm {
     pub bins: ::std::vec::Vec<Bin>,
     // @@protoc_insertion_point(field:npm.Npm.files)
     pub files: ::std::vec::Vec<File>,
+    // @@protoc_insertion_point(field:npm.Npm.has_native_gyp)
+    pub has_native_gyp: ::std::option::Option<bool>,
     // special fields
     // @@protoc_insertion_point(special_field:npm.Npm.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -1827,8 +1829,27 @@ impl Npm {
         self.vendored_file_count = ::std::option::Option::Some(v);
     }
 
+    // optional bool has_native_gyp = 21;
+
+    pub fn has_native_gyp(&self) -> bool {
+        self.has_native_gyp.unwrap_or(false)
+    }
+
+    pub fn clear_has_native_gyp(&mut self) {
+        self.has_native_gyp = ::std::option::Option::None;
+    }
+
+    pub fn has_has_native_gyp(&self) -> bool {
+        self.has_native_gyp.is_some()
+    }
+
+    // Param is passed by value, moved
+    pub fn set_has_native_gyp(&mut self, v: bool) {
+        self.has_native_gyp = ::std::option::Option::Some(v);
+    }
+
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(20);
+        let mut fields = ::std::vec::Vec::with_capacity(21);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
             "is_npm",
@@ -1929,6 +1950,11 @@ impl Npm {
             "files",
             |m: &Npm| { &m.files },
             |m: &mut Npm| { &mut m.files },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "has_native_gyp",
+            |m: &Npm| { &m.has_native_gyp },
+            |m: &mut Npm| { &mut m.has_native_gyp },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<Npm>(
             "Npm",
@@ -2031,6 +2057,9 @@ impl ::protobuf::Message for Npm {
                 162 => {
                     self.files.push(is.read_message()?);
                 },
+                168 => {
+                    self.has_native_gyp = ::std::option::Option::Some(is.read_bool()?);
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -2107,6 +2136,9 @@ impl ::protobuf::Message for Npm {
             let len = value.compute_size();
             my_size += 2 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         };
+        if let Some(v) = self.has_native_gyp {
+            my_size += 2 + 1;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -2173,6 +2205,9 @@ impl ::protobuf::Message for Npm {
         for v in &self.files {
             ::protobuf::rt::write_message_field_with_cached_size(20, v, os)?;
         };
+        if let Some(v) = self.has_native_gyp {
+            os.write_bool(21, v)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -2210,6 +2245,7 @@ impl ::protobuf::Message for Npm {
         self.scripts.clear();
         self.bins.clear();
         self.files.clear();
+        self.has_native_gyp = ::std::option::Option::None;
         self.special_fields.clear();
     }
 
@@ -2235,6 +2271,7 @@ impl ::protobuf::Message for Npm {
             scripts: ::std::vec::Vec::new(),
             bins: ::std::vec::Vec::new(),
             files: ::std::vec::Vec::new(),
+            has_native_gyp: ::std::option::Option::None,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -2275,7 +2312,7 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x01(\x08R\nisVendored\x12\x17\n\x07is_text\x18\x05\x20\x01(\x08R\x06isT\
     ext\x12\x1d\n\nsize_bytes\x18\x06\x20\x01(\x04R\tsizeBytes\x12\x1e\n\x06\
     sha256\x18\x07\x20\x01(\tR\x06sha256B\x06\x82\x93\x19\x02\x20\x01\x12\
-    \x18\n\x07content\x18\x08\x20\x01(\tR\x07content\"\xdc\x05\n\x03Npm\x12\
+    \x18\n\x07content\x18\x08\x20\x01(\tR\x07content\"\x82\x06\n\x03Npm\x12\
     \x15\n\x06is_npm\x18\x01\x20\x02(\x08R\x05isNpm\x12!\n\x0chas_manifest\
     \x18\x02\x20\x01(\x08R\x0bhasManifest\x12\x1a\n\x04name\x18\x03\x20\x01(\
     \tR\x04nameB\x06\x82\x93\x19\x02\x20\x01\x12\x18\n\x07version\x18\x04\
@@ -2294,8 +2331,9 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     pm.DependencyR\x0cdependencies\x12%\n\x07scripts\x18\x12\x20\x03(\x0b2\
     \x0b.npm.ScriptR\x07scripts\x12\x1c\n\x04bins\x18\x13\x20\x03(\x0b2\x08.\
     npm.BinR\x04bins\x12\x1f\n\x05files\x18\x14\x20\x03(\x0b2\t.npm.FileR\
-    \x05filesB#\xfa\x92\x19\x1f\n\x03npm\x12\x07npm.Npm\x1a\x03npm\"\nnpm-mo\
-    duleb\x06proto2\
+    \x05files\x12$\n\x0ehas_native_gyp\x18\x15\x20\x01(\x08R\x0chasNativeGyp\
+    B#\xfa\x92\x19\x1f\n\x03npm\x12\x07npm.Npm\x1a\x03npm\"\nnpm-moduleb\x06\
+    proto2\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

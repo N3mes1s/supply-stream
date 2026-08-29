@@ -62,4 +62,7 @@ message Npm {
   repeated Script scripts = 18;
   repeated Bin bins = 19;
   repeated File files = 20;
+  // True when the root package ships a binding.gyp build config, which
+  // node-gyp evaluates as Python during npm install of native addons.
+  optional bool has_native_gyp = 21;
 }

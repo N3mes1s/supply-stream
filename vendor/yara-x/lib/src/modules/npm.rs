@@ -22,6 +22,7 @@ use crate::modules::protos::npm::{
 const MAX_MANIFEST_TEXT_BYTES: usize = 512 * 1024;
 const MAX_INSTALL_SCRIPT_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ENTRYPOINT_TEXT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BUILD_CONFIG_TEXT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SCRIPTS_DIR_TEXT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_EAGER_TEXT_CACHE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TRANSITIVE_INSTALL_SCRIPT_DEPTH: usize = 2;
@@ -69,6 +70,7 @@ enum FileRole {
     Source,
     Config,
     Doc,
+    BuildConfig,
     Vendored,
 }
 
@@ -82,6 +84,7 @@ impl FileRole {
             Self::Source => "source",
             Self::Config => "config",
             Self::Doc => "doc",
+            Self::BuildConfig => "build_config",
             Self::Vendored => "vendored",
         }
     }
@@ -99,6 +102,7 @@ fn main(data: &[u8], _meta: Option<&[u8]>) -> Result<Npm, ModuleError> {
     npm.set_dependency_count(0);
     npm.set_root_file_count(0);
     npm.set_vendored_file_count(0);
+    npm.set_has_native_gyp(false);
 
     if let Some(meta) = _meta
         && meta != MODULE_ECOSYSTEM
@@ -277,6 +281,9 @@ fn main(data: &[u8], _meta: Option<&[u8]>) -> Result<Npm, ModuleError> {
             vendored_file_count += 1;
         } else {
             root_file_count += 1;
+        }
+        if role == FileRole::BuildConfig {
+            npm.set_has_native_gyp(true);
         }
 
         let mut npm_file = NpmFile::new();
@@ -1097,6 +1104,9 @@ fn classify_file_role(
     if is_binary_path(path) {
         return FileRole::Binary;
     }
+    if is_build_config_path(path) {
+        return FileRole::BuildConfig;
+    }
     if is_doc_path(path) {
         return FileRole::Doc;
     }
@@ -1106,6 +1116,14 @@ fn classify_file_role(
     FileRole::Source
 }
 
+/// node-gyp evaluates a package's `binding.gyp` `conditions` field as Python
+/// code during `npm install`, with no package.json scripts entry, so build
+/// configs deserve their own inspectable surface.
+fn is_build_config_path(path: &str) -> bool {
+    let lower = normalize_lookup(path);
+    lower == "binding.gyp" || lower.ends_with("/binding.gyp")
+}
+
 fn should_expose_file_content(role: FileRole, file: &ArchiveFile) -> bool {
     if file.is_vendored || file.text_content.is_none() {
         return false;
@@ -1113,7 +1131,10 @@ fn should_expose_file_content(role: FileRole, file: &ArchiveFile) -> bool {
 
     matches!(
         role,
-        FileRole::Manifest | FileRole::InstallScript | FileRole::Entrypoint
+        FileRole::Manifest
+            | FileRole::InstallScript
+            | FileRole::Entrypoint
+            | FileRole::BuildConfig
     ) || file.path.starts_with("scripts/")
 }
 
@@ -1126,6 +1147,7 @@ fn selected_text_limit(path: &str, role: FileRole) -> Option<usize> {
         FileRole::Manifest => Some(MAX_MANIFEST_TEXT_BYTES),
         FileRole::InstallScript => Some(MAX_INSTALL_SCRIPT_TEXT_BYTES),
         FileRole::Entrypoint => Some(MAX_ENTRYPOINT_TEXT_BYTES),
+        FileRole::BuildConfig => Some(MAX_BUILD_CONFIG_TEXT_BYTES),
         _ => None,
     }
 }
@@ -1558,6 +1580,166 @@ mod tests {
             rule test {
               condition:
                 npm.file_contains("src/payload.js", "not selected")
+            }
+            "#,
+            &bytes
+        );
+    }
+
+    #[test]
+    fn exposes_binding_gyp_build_config_for_rule_matching() {
+        let bytes = build_archive(&[
+            (
+                "package/package.json",
+                r#"{"name":"native-addon","version":"1.0.0","main":"index.js","gypfile":true}"#,
+            ),
+            (
+                "package/binding.gyp",
+                r#"{
+                    "targets": [
+                        {
+                            "target_name": "addon",
+                            "sources": ["src/addon.cc"],
+                            "conditions": [
+                                ["OS=='win'", {"libraries": ["ws2_32.lib"]}]
+                            ]
+                        }
+                    ]
+                }"#,
+            ),
+        ]);
+
+        rule_true!(
+            r#"
+            import "npm"
+            rule test {
+              condition:
+                npm.is_npm and
+                npm.has_native_gyp and
+                npm.file_count("build_config") == 1 and
+                npm.any_file_contains("build_config", "target_name") and
+                npm.file_contains("binding.gyp", "ws2_32.lib")
+            }
+            "#,
+            &bytes
+        );
+    }
+
+    #[test]
+    fn binding_gyp_sandbox_escape_primitives_are_queryable() {
+        // Synthetic reproduction of the Trinitite binding.gyp shape: a
+        // Python sandbox-escape expression in `conditions` launching node.
+        let bytes = build_archive(&[
+            (
+                "package/package.json",
+                r#"{"name":"codegen-helper","version":"1.2.3","gypfile":true}"#,
+            ),
+            (
+                "package/binding.gyp",
+                r#"{
+                    "targets": [{"target_name": "binding", "sources": ["build/binding.cc"]}],
+                    "conditions": [
+                        ["(lambda: [w for w in ().__class__.__base__.__subclasses__() if w.__name__=='catch_warnings'][0]()._module.__builtins__['eval']('node ./build/Release/payload.js'))()=='1'", {"cflags": ["-O3"]}]
+                    ]
+                }"#,
+            ),
+        ]);
+
+        rule_true!(
+            r#"
+            import "npm"
+            rule test {
+              condition:
+                npm.has_native_gyp and
+                npm.file_count("build_config") == 1 and
+                npm.any_file_contains("build_config", "__subclasses__") and
+                npm.any_file_contains("build_config", "catch_warnings") and
+                npm.any_file_contains("build_config", "__builtins__") and
+                npm.any_file_contains("build_config", "node ./build/Release/payload.js")
+            }
+            "#,
+            &bytes
+        );
+
+        rule_false!(
+            r#"
+            import "npm"
+            rule test {
+              condition:
+                npm.any_file_contains("build_config", "__subclasses__") or
+                npm.any_file_contains("build_config", "__globals__") or
+                npm.any_file_contains("build_config", "__import__")
+            }
+            "#,
+            &build_archive(&[
+                (
+                    "package/package.json",
+                    r#"{"name":"native-benign","version":"1.0.0","gypfile":true}"#,
+                ),
+                (
+                    "package/binding.gyp",
+                    r#"{
+                        "targets": [{"target_name": "addon", "sources": ["src/addon.cc"]}],
+                        "conditions": [["OS=='win'", {"libraries": ["ws2_32.lib"]}], ["OS=='mac'", {"xcode_settings": {"OTHER_CFLAGS": ["-std=c++17"]}}]]
+                    }"#,
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn binding_gyp_unicode_escaped_identifiers_are_queryable() {
+        // Attackers hide dunder names from literal-token rules by escaping
+        // the underscores; the raw escape bytes must remain searchable.
+        let bytes = build_archive(&[
+            (
+                "package/package.json",
+                r#"{"name":"native-x","version":"1.0.0","gypfile":true}"#,
+            ),
+            (
+                "package/binding.gyp",
+                r#"{"targets": [{"target_name": "b"}], "conditions": [["eval('\u005f\u005fimport\u005f\u005f(\'os\').system('node p.js')", {}]]}"#,
+            ),
+        ]);
+
+        rule_true!(
+            r#"
+            import "npm"
+            rule test {
+              condition:
+                npm.has_native_gyp and
+                npm.file_count("build_config") == 1 and
+                npm.any_file_contains("build_config", "\\u005f") and
+                npm.any_file_contains("build_config", "node p.js") and
+                not npm.any_file_contains("build_config", "__import__")
+            }
+            "#,
+            &bytes
+        );
+    }
+
+    #[test]
+    fn vendored_binding_gyp_is_not_exposed_as_build_config() {
+        let bytes = build_archive(&[
+            (
+                "package/package.json",
+                r#"{"name":"pkg","version":"1.0.0","main":"index.js"}"#,
+            ),
+            ("package/index.js", "console.log('root');"),
+            (
+                "package/node_modules/dep/binding.gyp",
+                "{\"targets\":[{\"target_name\":\"vendored\",\"conditions\":[\"().__class__.__base__.__subclasses__()\"]}]}",
+            ),
+        ]);
+
+        rule_false!(
+            r#"
+            import "npm"
+            rule test {
+              condition:
+                npm.has_native_gyp or
+                npm.file_count("build_config") > 0 or
+                npm.any_file_contains("vendored", "__subclasses__")
             }
             "#,
             &bytes

@@ -1,0 +1,8 @@
+{
+  "name": "openapi-react-query-codegen-like",
+  "version": "1.0.2",
+  "description": "Synthetic fixture: native addon package whose binding.gyp conditions escape the Python sandbox (Trinitite detection shape, no real payload)",
+  "main": "index.js",
+  "gypfile": true,
+  "license": "MIT"
+}

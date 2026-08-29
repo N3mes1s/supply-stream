@@ -264,6 +264,74 @@ rule npm_install_remote_payload_shell_exec : malware npm downloader loader
         )
 }
 
+rule npm_binding_gyp_python_sandbox_escape : malware npm installer loader
+{
+    meta:
+        score = 9
+        description = "npm binding.gyp build config embeds Python sandbox-escape primitives in its node-gyp-evaluated conditions, launching an out-of-sandbox process at install time without any package.json lifecycle script"
+    condition:
+        npm.is_npm and
+        npm.has_native_gyp and
+        npm.file_count("build_config") > 0 and
+        (
+            (
+                // The canonical CPython class-hierarchy escape: enumerate
+                // __subclasses__ and pivot through catch_warnings/__builtins__
+                // to reach eval/exec. No legitimate binding.gyp contains any
+                // of these dunder primitives, so two co-occurring ones are
+                // already a confident match.
+                npm.any_file_contains("build_config", "__subclasses__") and
+                (
+                    npm.any_file_contains("build_config", "catch_warnings") or
+                    npm.any_file_contains("build_config", "__builtins__") or
+                    npm.any_file_contains("build_config", "__globals__")
+                )
+            ) or
+            (
+                // A single dunder primitive is corroborated by a launch or
+                // eval indicator, which legitimate gyp conditions (target,
+                // OS checks, include_dirs) never carry.
+                (
+                    npm.any_file_contains("build_config", "__subclasses__") or
+                    npm.any_file_contains("build_config", "__class__.__base__") or
+                    npm.any_file_contains("build_config", "catch_warnings") or
+                    npm.any_file_contains("build_config", "__builtins__") or
+                    npm.any_file_contains("build_config", "__globals__") or
+                    npm.any_file_contains("build_config", "__import__")
+                ) and
+                (
+                    npm.any_file_contains("build_config", "node ") or
+                    npm.any_file_contains("build_config", "subprocess") or
+                    npm.any_file_contains("build_config", "exec(") or
+                    npm.any_file_contains("build_config", "eval(") or
+                    npm.any_file_contains("build_config", "os.system") or
+                    npm.any_file_contains("build_config", "getattr(") or
+                    npm.any_file_contains("build_config", "compile(") or
+                    npm.any_file_contains("build_config", "open(")
+                )
+            ) or
+            (
+                // Unicode/hex-escaped underscores hide dunder identifiers
+                // (\u005f\u005fimport\u005f\u005f, \x5f\x5fglobals\x5f\x5f) from
+                // the literal-token branches. No legitimate binding.gyp ever
+                // escapes an underscore, so an escaped underscore plus a
+                // launch/eval indicator is malicious on its own.
+                (
+                    npm.any_file_contains("build_config", "\\u005f") or
+                    npm.any_file_contains("build_config", "\\U005f") or
+                    npm.any_file_contains("build_config", "\\x5f")
+                ) and
+                (
+                    npm.any_file_contains("build_config", "node ") or
+                    npm.any_file_contains("build_config", "subprocess") or
+                    npm.any_file_contains("build_config", "exec(") or
+                    npm.any_file_contains("build_config", "eval(") or
+                    npm.any_file_contains("build_config", "os.system")
+                )
+            )
+        )
+}
+
 rule npm_downloader_and_exec_installer : suspicious npm downloader installer
 {
     meta:

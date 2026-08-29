@@ -145,6 +145,27 @@
       "details": {
         "main": "index.js"
       }
+    },
+    {
+      "id": "npm_binding_gyp_escape",
+      "ecosystem": "npm",
+      "package": "openapi-react-query-codegen-like",
+      "version": "1.0.2",
+      "format": "npm_tgz",
+      "fixture_dir": "npm-binding-gyp-escape",
+      "expected_verdict_class": "malware",
+      "expected_max_severity": "high",
+      "required_rules": [
+        "npm_binding_gyp_python_sandbox_escape"
+      ],
+      "required_behavior_tags": [
+        "dynamic_execution",
+        "install_or_build_execution"
+      ],
+      "details": {
+        "has_install_scripts": false,
+        "gypfile": true
+      }
     }
   ]
 }

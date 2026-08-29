@@ -406,15 +406,6 @@ pub struct PriorityScoreStatsSummary {
     pub ecosystems: Vec<PriorityScoreEcosystemSummary>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
-pub struct LocalGraphHydrationSummary {
-    pub graph_packages: usize,
-    pub existing_scores: usize,
-    pub missing_graph_packages: usize,
-    pub hydrated_scores: usize,
-    pub batches: usize,
-}
-
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PriorityScoreEcosystemSummary {
     pub ecosystem: Ecosystem,
@@ -1531,107 +1522,6 @@ pub async fn rescore_local_graph_roots(
     Ok(rescored)
 }
 
-pub async fn hydrate_local_graph_scores(
-    config: &PriorityConfig,
-    ecosystems: &[Ecosystem],
-    batch_size: usize,
-    per_root_limit: usize,
-) -> Result<LocalGraphHydrationSummary> {
-    let Some(graph_store_file) = config.graph_store_file.as_ref() else {
-        return Ok(LocalGraphHydrationSummary::default());
-    };
-
-    let store = OperationalStore::open(graph_store_file.clone()).await?;
-    let known_graph_packages = store.load_known_graph_packages(ecosystems).await?;
-    if known_graph_packages.is_empty() {
-        return Ok(LocalGraphHydrationSummary::default());
-    }
-
-    let existing_records =
-        load_priority_score_records_union(&config.score_file, Some(&store)).await?;
-    let existing_scored_packages = existing_records
-        .iter()
-        .map(|record| {
-            (
-                record.ecosystem,
-                normalize_package_name(record.ecosystem, &record.package),
-            )
-        })
-        .collect::<HashSet<_>>();
-    let mut missing_roots = known_graph_packages
-        .iter()
-        .filter(|key| !existing_scored_packages.contains(*key))
-        .cloned()
-        .collect::<Vec<_>>();
-    missing_roots.sort();
-
-    if missing_roots.is_empty() {
-        return Ok(LocalGraphHydrationSummary {
-            graph_packages: known_graph_packages.len(),
-            existing_scores: existing_scored_packages.len(),
-            missing_graph_packages: 0,
-            hydrated_scores: 0,
-            batches: 0,
-        });
-    }
-
-    let thresholds = fallback_thresholds(&existing_records);
-    let local_graph = LocalGraphFallback {
-        graph_file: config.graph_file.clone(),
-        thresholds,
-        score_build: config.expand_score_build.clone(),
-        store: Some(store.clone()),
-        cache: Mutex::new(None),
-    };
-
-    let mut updates = Vec::new();
-    let mut batches = 0usize;
-    for batch in missing_roots.chunks(batch_size.max(1)) {
-        batches += 1;
-        let mut grouped = BTreeMap::<Ecosystem, Vec<String>>::new();
-        for (ecosystem, package) in batch {
-            grouped.entry(*ecosystem).or_default().push(package.clone());
-        }
-        for (ecosystem, packages) in grouped {
-            let snapshots = local_graph
-                .score_neighborhood(ecosystem, &packages, per_root_limit.max(1))
-                .await?;
-            for (package, snapshot) in snapshots {
-                updates.push(PriorityScoreRecord {
-                    ecosystem,
-                    package,
-                    priority_tier: snapshot.tier,
-                    priority_source: Some(snapshot.source),
-                    direct_popularity: snapshot.direct_popularity,
-                    propagated_impact: snapshot.propagated_impact,
-                    hidden_leverage: snapshot.hidden_leverage,
-                    computed_at: snapshot.computed_at,
-                    score_source_version: snapshot.score_source_version.clone(),
-                });
-            }
-        }
-    }
-
-    let (merged_scores, effective_updates) =
-        merge_priority_score_records(existing_records, &updates);
-    if !effective_updates.is_empty() {
-        store
-            .record_priority_score_records(&effective_updates)
-            .await?;
-        if config.graph_store_file.is_none() {
-            write_priority_score_records(&config.score_file, &merged_scores).await?;
-        }
-    }
-
-    Ok(LocalGraphHydrationSummary {
-        graph_packages: known_graph_packages.len(),
-        existing_scores: existing_scored_packages.len(),
-        missing_graph_packages: missing_roots.len(),
-        hydrated_scores: effective_updates.len(),
-        batches,
-    })
-}
-
 async fn load_priority_score_records_with_store(
     score_file: &Path,
     graph_store_file: Option<&Path>,
@@ -1647,19 +1537,6 @@ async fn load_priority_score_records_with_store(
         return Ok(file_records);
     }
 
-    let (merged, _) = merge_priority_score_records(file_records, &store_records);
-    Ok(merged)
-}
-
-async fn load_priority_score_records_union(
-    score_file: &Path,
-    store: Option<&OperationalStore>,
-) -> Result<Vec<PriorityScoreRecord>> {
-    let file_records = load_priority_score_records(score_file).await?;
-    let Some(store) = store else {
-        return Ok(file_records);
-    };
-    let store_records = store.load_priority_score_records().await?;
     let (merged, _) = merge_priority_score_records(file_records, &store_records);
     Ok(merged)
 }
@@ -3799,96 +3676,6 @@ mod tests {
         assert_eq!(
             inspection.reverse_dependents,
             vec!["aider-chat".to_string(), "open-webui".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn hydrates_local_graph_scores_from_store() {
-        let temp = tempdir().unwrap();
-        let score_path = temp.path().join("priority-scores.ndjson");
-        let graph_path = temp.path().join("graph-input.ndjson");
-        let census_path = temp.path().join("package-census.ndjson");
-        let store_path = temp.path().join("index.sqlite");
-        tokio::fs::write(&score_path, "").await.unwrap();
-        tokio::fs::write(&graph_path, "").await.unwrap();
-        tokio::fs::write(&census_path, "").await.unwrap();
-
-        let store = OperationalStore::open(store_path.clone()).await.unwrap();
-        store
-            .record_graph_records(&[
-                scoring::ScoreInputRecord::Package {
-                    ecosystem: Ecosystem::Pypi,
-                    package: "litellm".to_string(),
-                    direct_popularity: 7.0,
-                },
-                scoring::ScoreInputRecord::Dependency {
-                    ecosystem: Ecosystem::Pypi,
-                    package: "open-webui".to_string(),
-                    dependency: "litellm".to_string(),
-                    weight: 1.0,
-                    sources: vec!["capture_metadata".to_string()],
-                    confidence: Some(1.0),
-                },
-            ])
-            .await
-            .unwrap();
-
-        let config = PriorityConfig {
-            score_file: score_path.clone(),
-            graph_file: graph_path,
-            graph_store_file: Some(store_path),
-            census_file: census_path,
-            online_fallback: false,
-            online_expand_unknown: false,
-            online_expand_min_observations: 2,
-            online_request_timeout: std::time::Duration::from_secs(2),
-            deps_dev_v3_base: "https://api.deps.dev/v3".to_string(),
-            deps_dev_v3alpha_base: "https://api.deps.dev/v3alpha".to_string(),
-            expand_focus: crate::deps_dev::FocusDependentsConfig {
-                reverse_depth: 2,
-                max_frontier_packages: 1000,
-                include_non_highest_dependent_releases: false,
-                default_direct_popularity: 1.0,
-                direct_popularity_strategy:
-                    crate::deps_dev::DirectPopularityStrategy::DirectDependentCount,
-            },
-            expand_collect: crate::collector::CollectConfig {
-                max_depth: 1,
-                max_packages: 512,
-                request_concurrency: 16,
-                allow_external_fallback: true,
-            },
-            expand_score_build: crate::scoring::ScoreBuildConfig {
-                alpha: 0.85,
-                max_iterations: 64,
-                epsilon: 1e-6,
-                high_quantile: 0.99,
-                medium_quantile: 0.90,
-                score_source_version: Some("test_runtime_expand_v1".to_string()),
-            },
-        };
-
-        let summary = hydrate_local_graph_scores(&config, &[Ecosystem::Pypi], 32, 64)
-            .await
-            .unwrap();
-        assert_eq!(summary.graph_packages, 2);
-        assert_eq!(summary.existing_scores, 0);
-        assert_eq!(summary.missing_graph_packages, 2);
-        assert!(summary.hydrated_scores >= 2);
-
-        let score_body = tokio::fs::read_to_string(&score_path).await.unwrap();
-        assert!(score_body.trim().is_empty());
-
-        let stored_scores = store.load_priority_score_records().await.unwrap();
-        assert!(
-            stored_scores
-                .iter()
-                .any(|record| record.package == "litellm")
-        );
-        assert!(
-            stored_scores
-                .iter()
-                .any(|record| record.priority_source == Some(PrioritySource::LocalGraph))
         );
     }
 

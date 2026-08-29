@@ -1,0 +1,56 @@
+syntax = "proto2";
+
+import "yara.proto";
+
+package pypi;
+
+option (yara.module_options) = {
+  name: "pypi"
+  root_message: "pypi.Pypi"
+  rust_module: "pypi"
+  cargo_feature: "pypi-module"
+};
+
+message Dependency {
+  optional string name = 1 [(yara.field_options).lowercase = true];
+  optional string section = 2 [(yara.field_options).lowercase = true];
+  optional string spec = 3;
+}
+
+message ConsoleScript {
+  optional string name = 1 [(yara.field_options).lowercase = true];
+  optional string target = 2;
+  optional string module_path = 3;
+  optional string content = 4;
+}
+
+message File {
+  optional string path = 1;
+  optional string role = 2 [(yara.field_options).lowercase = true];
+  optional bool is_root = 3;
+  optional bool is_text = 4;
+  optional uint64 size_bytes = 5;
+  optional string sha256 = 6 [(yara.field_options).lowercase = true];
+  optional string content = 7;
+}
+
+message Pypi {
+  required bool is_pypi = 1;
+  optional bool is_wheel = 2;
+  optional bool is_sdist = 3;
+  optional bool has_pyproject = 4;
+  optional bool has_setup_py = 5;
+  optional bool has_setup_cfg = 6;
+  optional bool has_console_scripts = 7;
+  optional string name = 8 [(yara.field_options).lowercase = true];
+  optional string version = 9;
+  optional string build_backend = 10 [(yara.field_options).lowercase = true];
+  optional string metadata_content = 11;
+  optional string pyproject_content = 12;
+  optional string setup_py_content = 13;
+  optional string entry_points_content = 14;
+  optional int64 dependency_count = 15;
+  repeated Dependency dependencies = 16;
+  repeated ConsoleScript console_scripts = 17;
+  repeated File files = 18;
+}

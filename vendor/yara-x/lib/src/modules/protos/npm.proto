@@ -1,0 +1,65 @@
+syntax = "proto2";
+
+import "yara.proto";
+
+package npm;
+
+option (yara.module_options) = {
+  name: "npm"
+  root_message: "npm.Npm"
+  rust_module: "npm"
+  cargo_feature: "npm-module"
+};
+
+message Dependency {
+  optional string name = 1 [(yara.field_options).lowercase = true];
+  optional string section = 2 [(yara.field_options).lowercase = true];
+  optional string spec = 3;
+}
+
+message Script {
+  optional string name = 1 [(yara.field_options).lowercase = true];
+  optional string command = 2;
+  optional string target_path = 3;
+  optional string content = 4;
+}
+
+message Bin {
+  optional string name = 1 [(yara.field_options).lowercase = true];
+  optional string path = 2;
+  optional string content = 3;
+}
+
+message File {
+  optional string path = 1;
+  optional string role = 2 [(yara.field_options).lowercase = true];
+  optional bool is_root = 3;
+  optional bool is_vendored = 4;
+  optional bool is_text = 5;
+  optional uint64 size_bytes = 6;
+  optional string sha256 = 7 [(yara.field_options).lowercase = true];
+  optional string content = 8;
+}
+
+message Npm {
+  required bool is_npm = 1;
+  optional bool has_manifest = 2;
+  optional string name = 3 [(yara.field_options).lowercase = true];
+  optional string version = 4;
+  optional bool has_install_script = 5;
+  optional bool has_bin = 6;
+  optional bool has_repository = 7;
+  optional bool windows_target = 8;
+  optional string package_json = 9;
+  optional string author = 10 [(yara.field_options).lowercase = true];
+  optional string package_manager = 11 [(yara.field_options).lowercase = true];
+  optional string main_path = 12;
+  optional string main_content = 13;
+  optional int64 dependency_count = 14;
+  optional int64 root_file_count = 15;
+  optional int64 vendored_file_count = 16;
+  repeated Dependency dependencies = 17;
+  repeated Script scripts = 18;
+  repeated Bin bins = 19;
+  repeated File files = 20;
+}

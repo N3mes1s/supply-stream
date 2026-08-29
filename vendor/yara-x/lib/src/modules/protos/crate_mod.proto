@@ -1,0 +1,51 @@
+syntax = "proto2";
+
+import "yara.proto";
+
+package crate_mod;
+
+option (yara.module_options) = {
+  name: "crate"
+  root_message: "crate_mod.Crate"
+  rust_module: "crate_mod"
+  cargo_feature: "crate-module"
+};
+
+message Dependency {
+  optional string name = 1 [(yara.field_options).lowercase = true];
+  optional string section = 2 [(yara.field_options).lowercase = true];
+  optional string spec = 3;
+}
+
+message Bin {
+  optional string name = 1 [(yara.field_options).lowercase = true];
+  optional string path = 2;
+  optional string content = 3;
+}
+
+message File {
+  optional string path = 1;
+  optional string role = 2 [(yara.field_options).lowercase = true];
+  optional bool is_root = 3;
+  optional bool is_text = 4;
+  optional uint64 size_bytes = 5;
+  optional string sha256 = 6 [(yara.field_options).lowercase = true];
+  optional string content = 7;
+}
+
+message Crate {
+  required bool is_crate = 1;
+  optional bool has_manifest = 2;
+  optional bool has_build_rs = 3;
+  optional bool has_bins = 4;
+  optional string name = 5 [(yara.field_options).lowercase = true];
+  optional string version = 6;
+  optional string repository = 7;
+  optional string cargo_toml_content = 8;
+  optional string build_rs_content = 9;
+  optional string cargo_vcs_sha = 10 [(yara.field_options).lowercase = true];
+  optional int64 dependency_count = 11;
+  repeated Dependency dependencies = 12;
+  repeated Bin bins = 13;
+  repeated File files = 14;
+}

@@ -6,3 +6,14 @@
 .cargo/
 .claude/
 .staging/
+
+# Vendored yara-x: upstream's own crates.io exclusions (~48MB of PE/Mach-O/.NET
+# module test samples + golden outputs; not needed to compile, only for
+# `cargo test -p yara-x` on modules we don't maintain). See vendor/yara-x/VENDOR.md.
+vendor/yara-x/lib/src/modules/**/*.zip
+vendor/yara-x/lib/src/modules/**/*.out
+
+# Local operator watch loops (ad-hoc, stateful; see scripts/stream-check.sh for
+# the durable equivalent)
+scripts/watch-stream-summary.sh
+scripts/watch-worthy-diffs.sh

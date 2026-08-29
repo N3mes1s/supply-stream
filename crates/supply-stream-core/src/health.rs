@@ -720,6 +720,42 @@ fn render_metrics(snapshot: &RuntimeSnapshot, health: &HealthSnapshot, ready: bo
 
     push_metric_help(
         &mut output,
+        "supply_stream_content_scan_completed_total",
+        "Total content-risk scans completed.",
+        "counter",
+    );
+    push_metric_value(
+        &mut output,
+        "supply_stream_content_scan_completed_total",
+        snapshot.content_scan_completed as f64,
+    );
+
+    push_metric_help(
+        &mut output,
+        "supply_stream_content_scan_avg_ms",
+        "Average content-risk scan time in milliseconds.",
+        "gauge",
+    );
+    push_metric_value(
+        &mut output,
+        "supply_stream_content_scan_avg_ms",
+        snapshot.content_scan_avg_ms,
+    );
+
+    push_metric_help(
+        &mut output,
+        "supply_stream_content_scan_max_ms",
+        "Maximum content-risk scan time in milliseconds.",
+        "gauge",
+    );
+    push_metric_value(
+        &mut output,
+        "supply_stream_content_scan_max_ms",
+        snapshot.content_scan_max_ms,
+    );
+
+    push_metric_help(
+        &mut output,
         "supply_stream_diff_enqueued_total",
         "Total diff requests enqueued.",
         "counter",
@@ -917,6 +953,9 @@ mod tests {
                 capture_queue_avg_ms: 27.0,
                 capture_run_avg_ms: 28.0,
                 capture_run_max_ms: 29.0,
+                content_scan_completed: 43,
+                content_scan_avg_ms: 12.0,
+                content_scan_max_ms: 44.0,
                 diff_enqueued: 30,
                 diff_skipped: 31,
                 diff_started: 32,

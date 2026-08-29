@@ -52,6 +52,9 @@ struct Inner {
     capture_queue_wait_us: AtomicU64,
     capture_run_us: AtomicU64,
     capture_run_max_us: AtomicU64,
+    content_scan_completed: AtomicU64,
+    content_scan_us: AtomicU64,
+    content_scan_max_us: AtomicU64,
     diff_enqueued: AtomicU64,
     diff_skipped: AtomicU64,
     diff_started: AtomicU64,
@@ -100,6 +103,9 @@ pub struct RuntimeSnapshot {
     pub capture_queue_avg_ms: f64,
     pub capture_run_avg_ms: f64,
     pub capture_run_max_ms: f64,
+    pub content_scan_completed: u64,
+    pub content_scan_avg_ms: f64,
+    pub content_scan_max_ms: f64,
     pub diff_enqueued: u64,
     pub diff_skipped: u64,
     pub diff_started: u64,
@@ -150,6 +156,9 @@ impl Default for RuntimeStats {
                 capture_queue_wait_us: AtomicU64::new(0),
                 capture_run_us: AtomicU64::new(0),
                 capture_run_max_us: AtomicU64::new(0),
+                content_scan_completed: AtomicU64::new(0),
+                content_scan_us: AtomicU64::new(0),
+                content_scan_max_us: AtomicU64::new(0),
                 diff_enqueued: AtomicU64::new(0),
                 diff_skipped: AtomicU64::new(0),
                 diff_started: AtomicU64::new(0),
@@ -283,6 +292,14 @@ impl RuntimeStats {
         update_max(&self.inner.capture_run_max_us, duration);
     }
 
+    pub fn record_content_scan(&self, duration: Duration) {
+        self.inner
+            .content_scan_completed
+            .fetch_add(1, Ordering::Relaxed);
+        add_duration(&self.inner.content_scan_us, duration);
+        update_max(&self.inner.content_scan_max_us, duration);
+    }
+
     pub fn record_diff_enqueued(&self) {
         self.inner.diff_enqueued.fetch_add(1, Ordering::Relaxed);
     }
@@ -400,6 +417,14 @@ impl RuntimeStats {
                 capture_completed.saturating_add(capture_failed),
             ),
             capture_run_max_ms: micros_to_ms(self.inner.capture_run_max_us.load(Ordering::Relaxed)),
+            content_scan_completed: self.inner.content_scan_completed.load(Ordering::Relaxed),
+            content_scan_avg_ms: average_ms(
+                self.inner.content_scan_us.load(Ordering::Relaxed),
+                self.inner.content_scan_completed.load(Ordering::Relaxed),
+            ),
+            content_scan_max_ms: micros_to_ms(
+                self.inner.content_scan_max_us.load(Ordering::Relaxed),
+            ),
             diff_enqueued,
             diff_skipped,
             diff_started,
@@ -460,6 +485,9 @@ impl RuntimeStats {
             capture_queue_avg_ms = snapshot.capture_queue_avg_ms,
             capture_run_avg_ms = snapshot.capture_run_avg_ms,
             capture_run_max_ms = snapshot.capture_run_max_ms,
+            content_scan_completed = snapshot.content_scan_completed,
+            content_scan_avg_ms = snapshot.content_scan_avg_ms,
+            content_scan_max_ms = snapshot.content_scan_max_ms,
             diff_enqueued = snapshot.diff_enqueued,
             diff_skipped = snapshot.diff_skipped,
             diff_started = snapshot.diff_started,

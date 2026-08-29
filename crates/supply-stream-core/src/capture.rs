@@ -602,7 +602,9 @@ impl CaptureContext {
                     "failed to persist local artifact for capture; falling back to URL-based scan"
                 );
             }
+            let scan_started = Instant::now();
             let content_risk = scan_captured_release(&self.http, &capture_dir, &capture).await;
+            self.perf.record_content_scan(scan_started.elapsed());
             set_capture_detail(&mut capture.details, "content_risk", &content_risk);
             write_json_pretty(&capture_dir.join("capture.json"), &capture).await?;
 

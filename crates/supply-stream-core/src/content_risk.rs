@@ -317,7 +317,16 @@ async fn scan_captured_release_inner(
     }
 
     let score = matches.iter().map(|matched| matched.score).sum::<u32>();
-    let suspicious = score >= 8;
+    // Context-only matches (credential path lists, IMDS addresses, OAST
+    // domains in docs) describe environment, not behavior; any number of them
+    // co-occur in legitimate cloud tooling, so they never flip the signal to
+    // suspicious on their own.
+    let behavior_score = matches
+        .iter()
+        .filter(|matched| matched.match_class != Some(DetectionMatchClass::ContextOnly))
+        .map(|matched| matched.score)
+        .sum::<u32>();
+    let suspicious = behavior_score >= 8;
     let reason = matches
         .iter()
         .max_by_key(|matched| matched.score)
@@ -1087,6 +1096,54 @@ mod tests {
                 .iter()
                 .any(|factor| factor == "iocs_extracted")
         );
+    }
+
+    #[tokio::test]
+    async fn context_only_matches_do_not_flip_signal_suspicious() {
+        let temp = tempdir().unwrap();
+        let archive = write_npm_archive(
+            temp.path(),
+            &[
+                (
+                    "package.json",
+                    &serde_json::to_string_pretty(&json!({
+                        "name": "cloud-tooling-demo",
+                        "version": "1.0.0",
+                        "main": "index.js"
+                    }))
+                    .unwrap(),
+                ),
+                (
+                    "docs/examples.md",
+                    "Query metadata at http://169.254.169.254/latest and test hooks \
+                     with https://webhook.site/your-id before deploying.",
+                ),
+            ],
+        );
+
+        let mut capture = sample_capture(Ecosystem::Npm, "cloud-tooling-demo");
+        capture.details["local_artifact"] = json!({ "path": archive });
+        let signal = scan_captured_release_inner(&reqwest::Client::new(), temp.path(), &capture)
+            .await
+            .unwrap();
+
+        // Both context-only rules match and their raw scores sum past the
+        // threshold, but environment markers alone never make the signal
+        // suspicious.
+        assert!(
+            signal
+                .factors
+                .iter()
+                .any(|factor| factor == "generic_cloud_metadata_service")
+        );
+        assert!(
+            signal
+                .factors
+                .iter()
+                .any(|factor| factor == "generic_oast_callback")
+        );
+        assert!(signal.score >= 8);
+        assert!(!signal.suspicious);
     }
 
     #[tokio::test]

@@ -2721,11 +2721,33 @@ rule generic_ssh_private_key_exfil : malware theft credential
         $net4 = "http.request("
         $net5 = "urllib.request.urlopen("
     condition:
-        // Key-file paths need any network verb; bare PEM headers show up in
+        // Real key theft reads the key and exfiltrates in the same file, so
+        // the network marker must sit within a 4KB window of the key
+        // reference; SSH tooling (ansible, git2, libssh2) mentions key paths
+        // and network verbs in unrelated places. Bare PEM headers show up in
         // every crypto library's test fixtures, so they only count next to a
         // hardcoded exfil channel.
-        (1 of ($ssh*) and (1 of ($net*) or 1 of ($chan*))) or
-        (1 of ($pem_header, $openssh_header, $ec_header) and 1 of ($chan*))
+        for any i in (1..#ssh1) : (
+            1 of ($net*, $chan*) in (@ssh1[i] - 4096 .. @ssh1[i] + 4096)
+        ) or
+        for any i in (1..#ssh2) : (
+            1 of ($net*, $chan*) in (@ssh2[i] - 4096 .. @ssh2[i] + 4096)
+        ) or
+        for any i in (1..#ssh3) : (
+            1 of ($net*, $chan*) in (@ssh3[i] - 4096 .. @ssh3[i] + 4096)
+        ) or
+        for any i in (1..#ssh4) : (
+            1 of ($net*, $chan*) in (@ssh4[i] - 4096 .. @ssh4[i] + 4096)
+        ) or
+        for any i in (1..#pem_header) : (
+            1 of ($chan*) in (@pem_header[i] - 4096 .. @pem_header[i] + 4096)
+        ) or
+        for any i in (1..#openssh_header) : (
+            1 of ($chan*) in (@openssh_header[i] - 4096 .. @openssh_header[i] + 4096)
+        ) or
+        for any i in (1..#ec_header) : (
+            1 of ($chan*) in (@ec_header[i] - 4096 .. @ec_header[i] + 4096)
+        )
 }
 
 rule generic_cloud_credential_paths : suspicious theft cloud

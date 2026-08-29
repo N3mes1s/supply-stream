@@ -2712,15 +2712,20 @@ rule generic_ssh_private_key_exfil : malware theft credential
         $pem_header = "-----BEGIN RSA PRIVATE KEY-----"
         $openssh_header = "-----BEGIN OPENSSH PRIVATE KEY-----"
         $ec_header = "-----BEGIN EC PRIVATE KEY-----"
-        $net1 = "discord.com/api/webhooks/"
-        $net2 = "api.telegram.org/bot"
-        $net3 = "http://"
-        $net4 = "https://"
-        $net5 = "requests.post("
-        $net6 = "fetch("
+        $chan1 = "discord.com/api/webhooks/"
+        $chan2 = "api.telegram.org/bot"
+        $chan3 = "createOrUpdateFileContents"
+        $net1 = "requests.post("
+        $net2 = "fetch("
+        $net3 = "https.request("
+        $net4 = "http.request("
+        $net5 = "urllib.request.urlopen("
     condition:
-        (1 of ($ssh*) or 1 of ($pem_header, $openssh_header, $ec_header)) and
-        1 of ($net*)
+        // Key-file paths need any network verb; bare PEM headers show up in
+        // every crypto library's test fixtures, so they only count next to a
+        // hardcoded exfil channel.
+        (1 of ($ssh*) and (1 of ($net*) or 1 of ($chan*))) or
+        (1 of ($pem_header, $openssh_header, $ec_header) and 1 of ($chan*))
 }
 
 rule generic_cloud_credential_paths : suspicious theft cloud
@@ -2860,8 +2865,8 @@ rule generic_self_deletion_destructive : malware destructive
         $shred = "shred -uvz"
         $del_all = "del /F /Q /S \"%USERPROFILE%"
         $cipher_wipe = "cipher /W:"
-        $rm_rf_home = "rm -rf ~/"
-        $rm_rf_slash = "rm -rf /"
+        $rm_rf_home = /rm -rf ['"]?~\/?[\s'";)&|]/
+        $rm_rf_slash = /rm -rf ['"]?\/\*?[\s'";)&|]/
         $xargs_shred = "xargs -0 shred"
     condition:
         1 of them

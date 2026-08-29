@@ -26,7 +26,8 @@
       "expected_max_severity": "high",
       "required_rules": [
         "npm_install_multiphase_secrets_exfil_agent",
-        "npm_install_secrets_harvesting_c2_agent"
+        "npm_install_secrets_harvesting_c2_agent",
+        "generic_cloud_metadata_service"
       ],
       "required_behavior_tags": ["exfiltration", "command_and_control", "install_or_build_execution"],
       "details": {
@@ -66,7 +67,10 @@
         "npm_github_actions_secret_artifact_exfil",
         "npm_github_actions_runner_memory_secret_scrape",
         "npm_cloud_secret_manager_exfiltration",
-        "npm_npm_token_publish_worm_propagation"
+        "npm_npm_token_worm_propagation",
+        "npm_npm_token_publish_worm_propagation",
+        "generic_cloud_credential_paths",
+        "generic_ssh_private_key_exfil"
       ],
       "required_behavior_tags": [
         "credential_or_wallet_theft",
@@ -116,7 +120,10 @@
       "format": "pypi_wheel",
       "fixture_dir": "anikoto-like",
       "expected_verdict_class": "clean",
-      "expected_max_severity": "informational"
+      "expected_max_severity": "informational",
+      "required_rules": [
+        "generic_browser_credential_database"
+      ]
     }
   ]
 }

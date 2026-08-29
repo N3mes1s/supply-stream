@@ -1,20 +1,18 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeSet, HashSet},
     ffi::OsStr,
     fs, io,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tar::Archive as TarArchive;
-use tempfile::tempdir;
-use tokio::{fs as tokio_fs, io::AsyncWriteExt, task};
+use tokio::{fs as tokio_fs, task};
 use yara_x::{Compiler, MetaValue, Rules, ScanOptions, Scanner};
 use zip::ZipArchive;
 
@@ -26,13 +24,11 @@ use crate::{
 };
 
 const DEFAULT_RULES_DIR: &str = "rules/content-risk";
-const DEFAULT_MAX_SCANNED_FILES: usize = 32;
-const DEFAULT_MAX_FILE_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_PATTERN_MATCHES_PER_PATTERN: usize = 8;
 const DEFAULT_MATCH_PREVIEW_BYTES: usize = 96;
 const MAX_ARCHIVE_ENTRIES: usize = 8_192;
-const MAX_EXTRACTED_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_EXTRACTED_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const DECOMPRESSED_TARGET_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const NPM_MODULE_META: &[u8] = b"npm";
 const PYPI_MODULE_META: &[u8] = b"pypi";
 const CRATE_MODULE_META: &[u8] = b"crate";
@@ -153,7 +149,6 @@ enum FileRole {
     BuildScript,
     Entrypoint,
     Binary,
-    Module,
 }
 
 impl FileRole {
@@ -165,19 +160,6 @@ impl FileRole {
             Self::BuildScript => "build_script",
             Self::Entrypoint => "entrypoint",
             Self::Binary => "binary",
-            Self::Module => "module",
-        }
-    }
-
-    fn priority(self) -> usize {
-        match self {
-            Self::Archive => 0,
-            Self::Manifest => 1,
-            Self::InstallScript => 2,
-            Self::BuildScript => 3,
-            Self::Entrypoint => 4,
-            Self::Binary => 5,
-            Self::Module => 6,
         }
     }
 }
@@ -218,6 +200,8 @@ struct ScanTarget {
     bytes: Vec<u8>,
     text: bool,
     size_bytes: u64,
+    /// Whether ecosystem package modules should parse this target's bytes.
+    modules: bool,
 }
 
 pub async fn scan_captured_release(
@@ -286,63 +270,41 @@ async fn scan_captured_release_inner(
         ));
     };
 
-    let workspace = tempdir().context("failed to create content-risk workspace")?;
-    let archive_path = workspace.path().join(&artifact_name);
-    materialize_artifact(http, &artifact_source, &archive_path).await?;
-    let archive_bytes = tokio_fs::read(&archive_path)
-        .await
-        .with_context(|| format!("failed to read {}", archive_path.display()))?;
-
-    let (package_context, scan_targets) = if matches!(
-        capture.ecosystem,
-        Ecosystem::Npm | Ecosystem::Pypi | Ecosystem::CratesIo
-    ) {
-        (
-            PackageScanContext::from_capture(capture, None)?,
-            // Package archive semantics belong in ecosystem YARA-X modules.
-            // The product passes the raw artifact and persists the result, but
-            // it does not decide which package files are semantically important.
-            archive_scan_target(capture.ecosystem, artifact_name.as_str(), &archive_bytes)
-                .into_iter()
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        let extracted_dir = workspace.path().join("extracted");
-        tokio_fs::create_dir_all(&extracted_dir)
-            .await
-            .with_context(|| format!("failed to create {}", extracted_dir.display()))?;
-        extract_artifact(&archive_path, &extracted_dir, artifact_kind).await?;
-
-        let scan_root = normalize_scan_root(&extracted_dir)?;
-        let package_context = PackageScanContext::from_capture(capture, Some(&scan_root))?;
-        let mut scan_targets = collect_scan_targets(&scan_root, capture)?;
-        if let Some(archive_target) =
-            archive_scan_target(capture.ecosystem, artifact_name.as_str(), &archive_bytes)
-        {
-            scan_targets.insert(0, archive_target);
-        }
-        (package_context, scan_targets)
-    };
-
-    if scan_targets.is_empty() {
-        return Ok(skipped_signal(
-            "content-risk scan skipped: no meaningful extracted files",
-        ));
-    }
-
+    let archive_bytes = load_artifact_bytes(http, &artifact_source).await?;
+    let package_context = PackageScanContext::from_capture(capture, None)?;
     let rules_dir = content_risk_rules_dir();
-    let (rules, fingerprint) = load_ruleset(&rules_dir)?;
-    let matches = run_yara_scan(&rules, &package_context, &scan_targets)?;
-    let iocs = extract_iocs(&scan_targets);
-    let scanned_files = scan_targets
-        .iter()
-        .map(|target| ScannedContentFile {
-            path: target.path.clone(),
-            role: target.role.as_str().to_string(),
-            size_bytes: target.size_bytes,
-            text: target.text,
-        })
-        .collect::<Vec<_>>();
+
+    // The YARA scan and archive decompression are CPU-bound and can take
+    // seconds on large artifacts; keep them off the async runtime threads.
+    let (matches, iocs, scanned_files, fingerprint) = task::spawn_blocking(move || {
+        let (rules, fingerprint) = load_ruleset(&rules_dir)?;
+
+        // Package archive semantics belong in ecosystem YARA-X modules.
+        // The product passes the raw artifact and persists the result, but
+        // it does not decide which package files are semantically important.
+        // A second, decompressed view of the archive is scanned with modules
+        // disabled so plain `strings:` rules and IOC extraction see file
+        // content instead of compressed bytes.
+        let decompressed =
+            decompressed_scan_target(artifact_name.as_str(), artifact_kind, &archive_bytes);
+        let mut scan_targets = vec![archive_scan_target(artifact_name.as_str(), archive_bytes)];
+        scan_targets.extend(decompressed);
+
+        let matches = run_yara_scan(&rules, &package_context, &scan_targets)?;
+        let iocs = extract_iocs(&scan_targets);
+        let scanned_files = scan_targets
+            .iter()
+            .map(|target| ScannedContentFile {
+                path: target.path.clone(),
+                role: target.role.as_str().to_string(),
+                size_bytes: target.size_bytes,
+                text: target.text,
+            })
+            .collect::<Vec<_>>();
+        anyhow::Ok((matches, iocs, scanned_files, fingerprint))
+    })
+    .await
+    .context("content-risk scan task panicked")??;
 
     let mut factors = matches
         .iter()
@@ -506,11 +468,7 @@ fn artifact_kind_from_filename(filename: &str) -> Option<ArtifactKind> {
     }
 }
 
-async fn materialize_artifact(
-    http: &reqwest::Client,
-    source: &ArtifactSource,
-    destination: &Path,
-) -> Result<()> {
+async fn load_artifact_bytes(http: &reqwest::Client, source: &ArtifactSource) -> Result<Vec<u8>> {
     match source {
         ArtifactSource::Url(url) => {
             let response = http
@@ -524,375 +482,77 @@ async fn materialize_artifact(
                 .bytes()
                 .await
                 .with_context(|| format!("failed to read artifact body from {url}"))?;
-            let mut file = tokio_fs::File::create(destination)
-                .await
-                .with_context(|| format!("failed to create {}", destination.display()))?;
-            file.write_all(&bytes)
-                .await
-                .with_context(|| format!("failed to write {}", destination.display()))?;
-            file.flush()
-                .await
-                .with_context(|| format!("failed to flush {}", destination.display()))?;
-            Ok(())
+            Ok(bytes.to_vec())
         }
-        ArtifactSource::LocalPath(path) => {
-            tokio_fs::copy(path, destination).await.with_context(|| {
-                format!(
-                    "failed to copy local artifact {} to {}",
-                    path.display(),
-                    destination.display()
-                )
-            })?;
-            Ok(())
-        }
+        ArtifactSource::LocalPath(path) => tokio_fs::read(path)
+            .await
+            .with_context(|| format!("failed to read local artifact {}", path.display())),
     }
 }
 
-async fn extract_artifact(archive: &Path, destination: &Path, kind: ArtifactKind) -> Result<()> {
-    tokio_fs::create_dir_all(destination)
-        .await
-        .with_context(|| format!("failed to create {}", destination.display()))?;
-
-    let archive = archive.to_path_buf();
-    let destination = destination.to_path_buf();
-    task::spawn_blocking(move || match kind {
-        ArtifactKind::Zip => extract_zip_archive(&archive, &destination),
-        ArtifactKind::TarGz => extract_tar_gz_archive(&archive, &destination),
-    })
-    .await
-    .context("extractor task join failed")?
+fn archive_scan_target(artifact_name: &str, archive_bytes: Vec<u8>) -> ScanTarget {
+    ScanTarget {
+        path: artifact_name.to_string(),
+        role: FileRole::Archive,
+        text: false,
+        size_bytes: archive_bytes.len() as u64,
+        modules: true,
+        bytes: archive_bytes,
+    }
 }
 
-fn extract_tar_gz_archive(archive: &Path, destination: &Path) -> Result<()> {
-    let file =
-        fs::File::open(archive).with_context(|| format!("failed to open {}", archive.display()))?;
-    let decoder = GzDecoder::new(file);
-    let mut archive_reader = TarArchive::new(decoder);
-    let mut entry_count = 0usize;
-    let mut total_bytes = 0u64;
-
-    for entry in archive_reader
-        .entries()
-        .with_context(|| format!("failed to read entries from {}", archive.display()))?
-    {
-        let mut entry =
-            entry.with_context(|| format!("failed to read entry from {}", archive.display()))?;
-        entry_count += 1;
-        if entry_count > MAX_ARCHIVE_ENTRIES {
-            return Err(anyhow!(
-                "archive {} exceeds maximum entry count ({MAX_ARCHIVE_ENTRIES})",
-                archive.display()
-            ));
-        }
-
-        let entry_type = entry.header().entry_type();
-        let relative = sanitize_archive_path(
-            entry
-                .path()
-                .with_context(|| format!("failed to read path from {}", archive.display()))?
-                .as_ref(),
-        )?;
-        let target = destination.join(&relative);
-
-        if entry_type.is_dir() {
-            fs::create_dir_all(&target)
-                .with_context(|| format!("failed to create {}", target.display()))?;
-            continue;
-        }
-
-        if !entry_type.is_file() {
-            return Err(anyhow!(
-                "archive {} contains unsupported entry type at {}",
-                archive.display(),
-                relative.display()
-            ));
-        }
-
-        let size = entry.size();
-        ensure_archive_size_limits(archive, relative.as_path(), &mut total_bytes, size)?;
-        write_archive_file(&mut entry, &target)?;
-    }
-
-    Ok(())
-}
-
-fn extract_zip_archive(archive: &Path, destination: &Path) -> Result<()> {
-    let file =
-        fs::File::open(archive).with_context(|| format!("failed to open {}", archive.display()))?;
-    let mut zip =
-        ZipArchive::new(file).with_context(|| format!("failed to open {}", archive.display()))?;
-    let mut total_bytes = 0u64;
-
-    if zip.len() > MAX_ARCHIVE_ENTRIES {
-        return Err(anyhow!(
-            "archive {} exceeds maximum entry count ({MAX_ARCHIVE_ENTRIES})",
-            archive.display()
-        ));
-    }
-
-    for index in 0..zip.len() {
-        let mut entry = zip
-            .by_index(index)
-            .with_context(|| format!("failed to read entry #{index} from {}", archive.display()))?;
-        let relative = entry.enclosed_name().ok_or_else(|| {
-            anyhow!(
-                "archive {} contains invalid path {}",
-                archive.display(),
-                entry.name()
-            )
-        })?;
-        let relative = sanitize_archive_path(&relative)?;
-        let target = destination.join(&relative);
-
-        if entry.is_dir() {
-            fs::create_dir_all(&target)
-                .with_context(|| format!("failed to create {}", target.display()))?;
-            continue;
-        }
-
-        let size = entry.size();
-        ensure_archive_size_limits(archive, relative.as_path(), &mut total_bytes, size)?;
-        write_archive_file(&mut entry, &target)?;
-    }
-
-    Ok(())
-}
-
-fn sanitize_archive_path(path: &Path) -> Result<PathBuf> {
-    let mut sanitized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => sanitized.push(part),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(anyhow!(
-                    "archive entry uses an unsafe path component: {}",
-                    path.display()
-                ));
-            }
-        }
-    }
-
-    if sanitized.as_os_str().is_empty() {
-        return Err(anyhow!("archive entry path is empty"));
-    }
-
-    Ok(sanitized)
-}
-
-fn ensure_archive_size_limits(
-    archive: &Path,
-    relative: &Path,
-    total_bytes: &mut u64,
-    size: u64,
-) -> Result<()> {
-    if size > MAX_EXTRACTED_FILE_BYTES {
-        return Err(anyhow!(
-            "archive {} entry {} exceeds per-file limit ({MAX_EXTRACTED_FILE_BYTES} bytes)",
-            archive.display(),
-            relative.display()
-        ));
-    }
-
-    *total_bytes = total_bytes
-        .checked_add(size)
-        .ok_or_else(|| anyhow!("archive {} total size overflowed", archive.display()))?;
-    if *total_bytes > MAX_EXTRACTED_TOTAL_BYTES {
-        return Err(anyhow!(
-            "archive {} exceeds total extracted size limit ({MAX_EXTRACTED_TOTAL_BYTES} bytes)",
-            archive.display()
-        ));
-    }
-
-    Ok(())
-}
-
-fn write_archive_file(reader: &mut impl io::Read, target: &Path) -> Result<()> {
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
-    let mut file = fs::File::create(target)
-        .with_context(|| format!("failed to create {}", target.display()))?;
-    io::copy(reader, &mut file).with_context(|| format!("failed to write {}", target.display()))?;
-    Ok(())
-}
-
-fn normalize_scan_root(extracted_dir: &Path) -> Result<PathBuf> {
-    let mut root = extracted_dir.to_path_buf();
-    loop {
-        let mut entries = fs::read_dir(&root)
-            .with_context(|| format!("failed to read {}", root.display()))?
-            .filter_map(|entry| entry.ok())
-            .collect::<Vec<_>>();
-        if entries.len() != 1 {
-            break;
-        }
-        let entry = entries.pop().expect("single directory entry");
-        let path = entry.path();
-        if path.is_dir() {
-            root = path;
-        } else {
-            break;
-        }
-    }
-    Ok(root)
-}
-
-fn collect_scan_targets(scan_root: &Path, capture: &CapturedRelease) -> Result<Vec<ScanTarget>> {
-    let all_files = collect_files(scan_root)?;
-    let mut prioritized = BTreeMap::<String, FileRole>::new();
-
-    match capture.ecosystem {
-        Ecosystem::Npm => {}
-        Ecosystem::Pypi => {}
-        Ecosystem::CratesIo => {}
-    }
-
-    add_fallback_source_targets(capture.ecosystem, &all_files, &mut prioritized);
-    add_binary_targets(&all_files, &mut prioritized);
-
-    let mut ordered = prioritized
-        .into_iter()
-        .map(|(path, role)| {
-            let absolute_path = all_files
-                .get(&path)
-                .cloned()
-                .ok_or_else(|| anyhow!("missing collected file path {path}"))?;
-            Ok((role.priority(), path, role, absolute_path))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    ordered.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
-
-    ordered
-        .into_iter()
-        .take(DEFAULT_MAX_SCANNED_FILES)
-        .map(|(_, path, role, absolute_path)| {
-            let metadata = fs::metadata(&absolute_path)
-                .with_context(|| format!("failed to stat {}", absolute_path.display()))?;
-            let size_bytes = metadata.len();
-            if size_bytes > DEFAULT_MAX_FILE_BYTES as u64 {
-                return Ok(None);
-            }
-            let bytes = fs::read(&absolute_path)
-                .with_context(|| format!("failed to read {}", absolute_path.display()))?;
-            let text = looks_like_text(&bytes);
-            Ok(Some(ScanTarget {
-                path,
-                role,
-                bytes,
-                text,
-                size_bytes,
-            }))
-        })
-        .filter_map(|result| match result {
-            Ok(Some(target)) => Some(Ok(target)),
-            Ok(None) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<Result<Vec<_>>>()
-}
-
-fn archive_scan_target(
-    ecosystem: Ecosystem,
+/// Builds an in-memory decompressed view of the artifact so plain `strings:`
+/// rules and IOC regexes can match file content. Ecosystem modules do their
+/// own structured extraction from the raw archive; this target is scanned
+/// with modules disabled.
+fn decompressed_scan_target(
     artifact_name: &str,
+    kind: ArtifactKind,
     archive_bytes: &[u8],
 ) -> Option<ScanTarget> {
-    if !matches!(
-        ecosystem,
-        Ecosystem::Npm | Ecosystem::Pypi | Ecosystem::CratesIo
-    ) {
+    let bytes = match kind {
+        ArtifactKind::TarGz => {
+            let mut decoded = Vec::new();
+            let mut reader =
+                io::Read::take(GzDecoder::new(archive_bytes), DECOMPRESSED_TARGET_MAX_BYTES);
+            io::Read::read_to_end(&mut reader, &mut decoded).ok()?;
+            decoded
+        }
+        ArtifactKind::Zip => {
+            let mut zip = ZipArchive::new(io::Cursor::new(archive_bytes)).ok()?;
+            let mut decoded = Vec::new();
+            for index in 0..zip.len().min(MAX_ARCHIVE_ENTRIES) {
+                let Ok(entry) = zip.by_index(index) else {
+                    continue;
+                };
+                if !entry.is_file() {
+                    continue;
+                }
+                let remaining = DECOMPRESSED_TARGET_MAX_BYTES.saturating_sub(decoded.len() as u64);
+                if remaining == 0 {
+                    break;
+                }
+                let mut reader = io::Read::take(entry, remaining);
+                if io::Read::read_to_end(&mut reader, &mut decoded).is_ok() {
+                    decoded.push(b'\n');
+                }
+            }
+            decoded
+        }
+    };
+
+    if bytes.is_empty() {
         return None;
     }
 
     Some(ScanTarget {
-        path: artifact_name.to_string(),
+        path: format!("{artifact_name}!decompressed"),
         role: FileRole::Archive,
-        bytes: archive_bytes.to_vec(),
-        text: false,
-        size_bytes: archive_bytes.len() as u64,
+        text: true,
+        size_bytes: bytes.len() as u64,
+        modules: false,
+        bytes,
     })
-}
-
-fn add_fallback_source_targets(
-    ecosystem: Ecosystem,
-    all_files: &BTreeMap<String, PathBuf>,
-    prioritized: &mut BTreeMap<String, FileRole>,
-) {
-    let suffixes: &[&str] = match ecosystem {
-        Ecosystem::Npm => &[".js", ".mjs", ".cjs"],
-        Ecosystem::Pypi => &[".py"],
-        Ecosystem::CratesIo => &[".rs"],
-    };
-
-    let candidates = all_files
-        .keys()
-        .filter(|path| {
-            suffixes.iter().any(|suffix| path.ends_with(suffix))
-                && !prioritized.contains_key(path.as_str())
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    for path in candidates {
-        insert_role(prioritized, path.clone(), FileRole::Module);
-    }
-}
-
-fn add_binary_targets(
-    all_files: &BTreeMap<String, PathBuf>,
-    prioritized: &mut BTreeMap<String, FileRole>,
-) {
-    let candidates = all_files
-        .keys()
-        .filter(|path| is_binary_path(path) && !prioritized.contains_key(path.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    for path in candidates {
-        insert_role(prioritized, path.clone(), FileRole::Binary);
-    }
-}
-
-fn insert_role(prioritized: &mut BTreeMap<String, FileRole>, path: String, role: FileRole) {
-    match prioritized.get(&path).copied() {
-        Some(existing) if existing.priority() <= role.priority() => {}
-        _ => {
-            prioritized.insert(path, role);
-        }
-    }
-}
-
-fn collect_files(root: &Path) -> Result<BTreeMap<String, PathBuf>> {
-    fn walk(base: &Path, current: &Path, out: &mut BTreeMap<String, PathBuf>) -> Result<()> {
-        for entry in fs::read_dir(current)
-            .with_context(|| format!("failed to read {}", current.display()))?
-        {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                walk(base, &path, out)?;
-            } else if path.is_file() {
-                let relative = path
-                    .strip_prefix(base)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                out.insert(relative, path);
-            }
-        }
-        Ok(())
-    }
-
-    let mut out = BTreeMap::new();
-    walk(root, root, &mut out)?;
-    Ok(out)
-}
-
-fn is_binary_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    [".exe", ".dll", ".node", ".so", ".dylib"]
-        .iter()
-        .any(|suffix| lower.ends_with(suffix))
 }
 
 fn looks_like_text(bytes: &[u8]) -> bool {
@@ -1040,15 +700,18 @@ fn run_yara_scan(
 ) -> Result<Vec<ContentRiskMatch>> {
     let mut scanner = Scanner::new(rules);
     scanner.max_matches_per_pattern(DEFAULT_MAX_PATTERN_MATCHES_PER_PATTERN);
+    scanner.set_timeout(SCAN_TIMEOUT);
     let mut matches = Vec::new();
 
     for target in scan_targets {
         apply_globals(&mut scanner, package_context, target)?;
+        let options = if target.modules {
+            module_scan_options(package_context.ecosystem)
+        } else {
+            disabled_module_scan_options()
+        };
         let results = scanner
-            .scan_with_options(
-                &target.bytes,
-                module_scan_options(package_context.ecosystem),
-            )
+            .scan_with_options(&target.bytes, options)
             .with_context(|| format!("content-risk scan failed for {}", target.path))?;
 
         for matched_rule in results.matching_rules() {
@@ -1124,6 +787,13 @@ fn run_yara_scan(
             .then(left.file_path.cmp(&right.file_path))
     });
     Ok(matches)
+}
+
+fn disabled_module_scan_options() -> ScanOptions<'static> {
+    ScanOptions::new()
+        .set_module_metadata("npm", DISABLED_MODULE_META)
+        .set_module_metadata("pypi", DISABLED_MODULE_META)
+        .set_module_metadata("crate", DISABLED_MODULE_META)
 }
 
 fn module_scan_options(ecosystem: Ecosystem) -> ScanOptions<'static> {
@@ -1310,7 +980,6 @@ fn content_risk_rules_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io;
     use std::path::{Path, PathBuf};
     use std::process::Command as ProcessCommand;
 
@@ -1375,49 +1044,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_tar_symlink_entries_during_extraction() {
+    async fn decompressed_target_matches_strings_rules_and_extracts_iocs() {
         let temp = tempdir().unwrap();
-        let archive_path = temp.path().join("bad.tgz");
-        let archive_file = fs::File::create(&archive_path).unwrap();
-        let encoder = GzEncoder::new(archive_file, Compression::default());
-        let mut builder = Builder::new(encoder);
+        let archive = write_npm_archive(
+            temp.path(),
+            &[
+                (
+                    "package.json",
+                    &serde_json::to_string_pretty(&json!({
+                        "name": "webhook-demo",
+                        "version": "1.0.0",
+                        "main": "index.js"
+                    }))
+                    .unwrap(),
+                ),
+                (
+                    "lib/notify.js",
+                    "const hook = 'https://discord.com/api/webhooks/1234567890/tok-abc';",
+                ),
+            ],
+        );
 
-        let mut header = Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Symlink);
-        header.set_mode(0o777);
-        header.set_size(0);
-        header.set_link_name("../outside").unwrap();
-        header.set_cksum();
-        builder
-            .append_data(&mut header, "package/link", io::empty())
+        let mut capture = sample_capture(Ecosystem::Npm, "webhook-demo");
+        capture.details["local_artifact"] = json!({ "path": archive });
+        let signal = scan_captured_release_inner(&reqwest::Client::new(), temp.path(), &capture)
+            .await
             .unwrap();
-        builder.finish().unwrap();
 
-        let destination = temp.path().join("extract");
-        let error = extract_artifact(&archive_path, &destination, ArtifactKind::TarGz)
-            .await
-            .unwrap_err();
-        assert!(!error.to_string().is_empty());
-        assert!(!destination.join("package/link").exists());
-    }
-
-    #[tokio::test]
-    async fn rejects_zip_path_traversal_entries_during_extraction() {
-        let temp = tempdir().unwrap();
-        let archive_path = temp.path().join("bad.zip");
-        let file = fs::File::create(&archive_path).unwrap();
-        let mut writer = zip::ZipWriter::new(file);
-        let options: FileOptions<'_, ()> =
-            FileOptions::default().compression_method(CompressionMethod::Deflated);
-        writer.start_file("../evil.txt", options).unwrap();
-        std::io::Write::write_all(&mut writer, b"owned").unwrap();
-        writer.finish().unwrap();
-
-        let destination = temp.path().join("extract");
-        let error = extract_artifact(&archive_path, &destination, ArtifactKind::Zip)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("invalid path"));
+        // The strings-based generic rule can only see the webhook URL on the
+        // decompressed view of the archive: deflate never leaves it literal
+        // in the compressed bytes.
+        let matched = signal
+            .matches
+            .iter()
+            .find(|matched| matched.rule_id == "generic_discord_or_telegram_exfil")
+            .expect("generic webhook rule should match decompressed content");
+        assert!(matched.file_path.ends_with("!decompressed"));
+        assert!(signal.iocs.iter().any(|ioc| ioc.kind == "discord_webhook"));
+        assert!(
+            signal
+                .factors
+                .iter()
+                .any(|factor| factor == "iocs_extracted")
+        );
     }
 
     #[tokio::test]
@@ -3414,6 +3083,7 @@ rule inline_pattern_evidence
             bytes: b"const hook='https://discord.com/api/webhooks/123/abc';".to_vec(),
             text: true,
             size_bytes: 55,
+            modules: true,
         }];
 
         let matches = run_yara_scan(&rules, &package_context, &scan_targets).unwrap();

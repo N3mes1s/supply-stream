@@ -627,6 +627,43 @@ impl OperationalStore {
         .await
     }
 
+    /// Loads (version, release time) pairs for one package's releases whose
+    /// release time falls at or after `since`. Release time is
+    /// `published_at` when the registry supplied it (npm/pypi do; crates.io
+    /// and some feeds do not) and falls back to `observed_at`.
+    ///
+    /// Focused query for the rapid version-burst signal: it touches only the
+    /// (ecosystem, package, release-time) index columns instead of
+    /// materializing full release records like `load_release_records_since`.
+    pub async fn load_package_release_times_since(
+        &self,
+        ecosystem: Ecosystem,
+        package: &str,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<(String, DateTime<Utc>)>> {
+        let package = normalize_package_name(ecosystem, package);
+        self.run_read_task(move |conn| {
+            let since = since.to_rfc3339();
+            let mut stmt = conn.prepare(
+                "SELECT version, COALESCE(published_at, observed_at)
+                 FROM release_index
+                 WHERE ecosystem = ?1 AND package = ?2 AND COALESCE(published_at, observed_at) >= ?3",
+            )?;
+            let rows = stmt.query_map(params![ecosystem.as_str(), package, since], |row| {
+                let version: String = row.get(0)?;
+                let released_at: String = row.get(1)?;
+                Ok((version, released_at))
+            })?;
+            let mut times = Vec::new();
+            for row in rows {
+                let (version, released_at) = row?;
+                times.push((version, parse_datetime(&released_at)?));
+            }
+            Ok(times)
+        })
+        .await
+    }
+
     pub async fn load_event(&self, event_id: &str) -> Result<Option<PackageReleaseEvent>> {
         let event_id = event_id.to_string();
         self.run_read_task(move |conn| {
@@ -3409,6 +3446,63 @@ mod tests {
         assert_eq!(
             neighborhood.reverse_dependents,
             vec!["pkg-a".to_string(), "pkg-c".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn store_loads_package_release_times_for_burst_window() {
+        let temp = tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let store = OperationalStore::open(index_db_path(&data_dir))
+            .await
+            .unwrap();
+
+        let base = Utc.with_ymd_and_hms(2026, 8, 31, 12, 0, 0).unwrap();
+        let seed = |package: &str, version: &str, offset_secs: i64| PackageReleaseEvent {
+            event_id: format!("npm:{package}@{version}"),
+            ecosystem: Ecosystem::Npm,
+            package: package.to_string(),
+            version: version.to_string(),
+            published_at: Some(base + chrono::Duration::seconds(offset_secs)),
+            observed_at: base + chrono::Duration::seconds(offset_secs),
+            source: "test".to_string(),
+            sequence: None,
+            package_url: None,
+            release_url: None,
+            metadata_url: None,
+            priority: Some(PrioritySnapshot::default_unknown()),
+        };
+        for (version, offset) in [("0.5.0", 0), ("1.6.0", 300), ("2.2.0", 600), ("3.0.0", 900)] {
+            store
+                .record_event(&seed("bursty", version, offset), EventOrigin::Observed)
+                .await
+                .unwrap();
+        }
+        // Different package, must not leak into the query.
+        store
+            .record_event(&seed("other", "9.9.9", 450), EventOrigin::Observed)
+            .await
+            .unwrap();
+        // Same package but outside the window.
+        store
+            .record_event(&seed("bursty", "0.1.0", -86_400), EventOrigin::Observed)
+            .await
+            .unwrap();
+
+        let since = base + chrono::Duration::seconds(300);
+        let times = store
+            .load_package_release_times_since(Ecosystem::Npm, "bursty", since)
+            .await
+            .unwrap();
+        assert_eq!(times.len(), 3);
+        let versions = times
+            .iter()
+            .map(|(version, _)| version.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(versions, vec!["1.6.0", "2.2.0", "3.0.0"]);
+        assert_eq!(
+            times[0],
+            ("1.6.0".to_string(), base + chrono::Duration::seconds(300))
         );
     }
 

@@ -2,6 +2,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::{ArgAction, Args, Parser, Subcommand};
 use supply_stream_core::{
+    assessment::VersionBurstConfig,
     config::{
         AppConfig, AutoDiffConfig, CaptureConfig, CratesConfig, NpmConfig, PriorityConfig,
         PriorityViewConfig, PypiConfig, TriageConfig,
@@ -146,6 +147,12 @@ pub struct RunArgs {
     pub npm_idle_delay_secs: u64,
     #[arg(long, default_value_t = true)]
     pub capture_pypi_provenance: bool,
+    #[arg(long, default_value_t = 1800)]
+    pub burst_window_secs: u64,
+    #[arg(long, default_value_t = 5)]
+    pub burst_min_versions: usize,
+    #[arg(long, default_value_t = 2)]
+    pub burst_min_major_lines: usize,
     #[arg(long)]
     pub once: bool,
 }
@@ -242,6 +249,11 @@ impl RunArgs {
                 pypi_provenance: self.capture_pypi_provenance,
                 github_api_base: "https://api.github.com".to_string(),
                 gitlab_api_base: "https://gitlab.com/api/v4".to_string(),
+                version_burst: VersionBurstConfig {
+                    window_secs: self.burst_window_secs,
+                    min_versions: self.burst_min_versions,
+                    min_major_lines: self.burst_min_major_lines,
+                },
             },
             autodiff: AutoDiffConfig {
                 queue_capacity: self.diff_queue_capacity,

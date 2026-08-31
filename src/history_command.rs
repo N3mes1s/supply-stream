@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use supply_stream_core::{
-    assessment::{DiffAssessmentInput, assess_release},
+    assessment::{DiffAssessmentInput, VersionBurstConfig, assess_release},
     bundle,
     capture::{CaptureRequest, CaptureWorker, CapturedRelease},
     config::{CaptureConfig, PriorityConfig},
@@ -1351,6 +1351,7 @@ async fn run_retry_captures(data_dir: &Path, workers: usize) -> Result<RetryCapt
             pypi_provenance: true,
             github_api_base: "https://api.github.com".to_string(),
             gitlab_api_base: "https://gitlab.com/api/v4".to_string(),
+            version_burst: VersionBurstConfig::default(),
         },
         rx,
         None,
@@ -1489,6 +1490,7 @@ async fn run_retry_skipped_captures(
             pypi_provenance: true,
             github_api_base: "https://api.github.com".to_string(),
             gitlab_api_base: "https://gitlab.com/api/v4".to_string(),
+            version_burst: VersionBurstConfig::default(),
         },
         rx,
         None,

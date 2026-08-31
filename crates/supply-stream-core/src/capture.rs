@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::{
+    assessment::{VersionBurstSignal, evaluate_version_burst},
     bundle,
     config::CaptureConfig,
     content_risk::{captured_content_risk, scan_captured_release},
@@ -39,6 +40,48 @@ const METADATA_RETRY_DELAY_MS: u64 = 250;
 const METADATA_BODY_PREVIEW_BYTES: usize = 256;
 static LOCAL_GRAPH_APPEND_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+impl CaptureContext {
+    /// Computes the rapid version-burst signal for a freshly captured release
+    /// and embeds it in the capture details (the same pattern as
+    /// `metadata_risk` / `content_risk`), so every assessment path (live
+    /// autodiff, history backfill, evidence bundles) reads it from the
+    /// persisted capture without further store queries.
+    ///
+    /// The candidate release itself is added to the release set: for High
+    /// priority it is already recorded in the store by the time post-capture
+    /// runs, while ephemeral triaged captures are not, and in both cases the
+    /// burst must be measured as of this release.
+    async fn compute_version_burst(
+        &self,
+        event: &PackageReleaseEvent,
+        capture: &CapturedRelease,
+    ) -> VersionBurstSignal {
+        let config = self.config.version_burst;
+        let since = chrono::Utc::now() - config.window();
+        let mut timestamps = match self
+            .store
+            .load_package_release_times_since(event.ecosystem, &event.package, since)
+            .await
+        {
+            Ok(times) => times,
+            Err(error) => {
+                warn!(
+                    event_id = event.event_id,
+                    error = %error,
+                    "failed to load package release times for version-burst evaluation"
+                );
+                Vec::new()
+            }
+        };
+        let candidate_at = capture
+            .published_at
+            .unwrap_or(capture.observed_at)
+            .max(event.observed_at);
+        timestamps.push((capture.version.clone(), candidate_at));
+        evaluate_version_burst(&timestamps, &config)
+    }
+}
 
 #[derive(Debug, Clone)]
 struct StagingCacheEntry {
@@ -606,6 +649,8 @@ impl CaptureContext {
             let content_risk = scan_captured_release(&self.http, &capture_dir, &capture).await;
             self.perf.record_content_scan(scan_started.elapsed());
             set_capture_detail(&mut capture.details, "content_risk", &content_risk);
+            let version_burst = self.compute_version_burst(event, &capture).await;
+            set_capture_detail(&mut capture.details, "version_burst", &version_burst);
             write_json_pretty(&capture_dir.join("capture.json"), &capture).await?;
 
             let graph_records = graph_records_from_captured_release(&capture);
@@ -632,7 +677,8 @@ impl CaptureContext {
             let retain_capture = matches!(retention, CaptureRetention::Permanent)
                 || should_retain_captured_release(&capture)
                 || notify_diff
-                || force_diff_reason.is_some();
+                || force_diff_reason.is_some()
+                || version_burst.suspicious;
             if !retain_capture {
                 self.perf.record_staging_cache_discarded();
                 self.store
@@ -2730,6 +2776,7 @@ fn relative_path(base: &Path, path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::{
+        assessment::VersionBurstConfig,
         event::{
             EmittedPackageReleaseEvent, EmittedPrioritySignal, EmittedReleaseAssessmentSignal,
         },
@@ -3206,6 +3253,7 @@ mod tests {
                 pypi_provenance: false,
                 github_api_base: "https://api.github.com".to_string(),
                 gitlab_api_base: "https://gitlab.com/api/v4".to_string(),
+                version_burst: VersionBurstConfig::default(),
             },
             diff_tx: None,
             priority: None,
@@ -3299,6 +3347,7 @@ mod tests {
                 pypi_provenance: false,
                 github_api_base: "https://api.github.com".to_string(),
                 gitlab_api_base: "https://gitlab.com/api/v4".to_string(),
+                version_burst: VersionBurstConfig::default(),
             },
             diff_tx: None,
             priority: None,
@@ -3510,6 +3559,7 @@ mod tests {
                 pypi_provenance: false,
                 github_api_base: "https://api.github.com".to_string(),
                 gitlab_api_base: "https://gitlab.com/api/v4".to_string(),
+                version_burst: VersionBurstConfig::default(),
             },
             rx,
             None,
@@ -3632,6 +3682,7 @@ mod tests {
                 pypi_provenance: false,
                 github_api_base: "https://api.github.com".to_string(),
                 gitlab_api_base: "https://gitlab.com/api/v4".to_string(),
+                version_burst: VersionBurstConfig::default(),
             },
             rx,
             None,
@@ -3791,6 +3842,7 @@ mod tests {
                 pypi_provenance: false,
                 github_api_base: "https://api.github.com".to_string(),
                 gitlab_api_base: "https://gitlab.com/api/v4".to_string(),
+                version_burst: VersionBurstConfig::default(),
             },
             rx,
             None,
@@ -3956,6 +4008,7 @@ mod tests {
                 pypi_provenance: false,
                 github_api_base: "https://api.github.com".to_string(),
                 gitlab_api_base: "https://gitlab.com/api/v4".to_string(),
+                version_burst: VersionBurstConfig::default(),
             },
             rx,
             None,
@@ -4044,6 +4097,7 @@ mod tests {
                 pypi_provenance: false,
                 github_api_base: "https://api.github.com".to_string(),
                 gitlab_api_base: "https://gitlab.com/api/v4".to_string(),
+                version_burst: VersionBurstConfig::default(),
             },
             rx,
             None,
@@ -4093,6 +4147,7 @@ mod tests {
                 pypi_provenance: false,
                 github_api_base: "https://api.github.com".to_string(),
                 gitlab_api_base: "https://gitlab.com/api/v4".to_string(),
+                version_burst: VersionBurstConfig::default(),
             },
             diff_tx: None,
             priority: None,
@@ -4204,6 +4259,7 @@ mod tests {
                 pypi_provenance: false,
                 github_api_base: "https://api.github.com".to_string(),
                 gitlab_api_base: "https://gitlab.com/api/v4".to_string(),
+                version_burst: VersionBurstConfig::default(),
             },
             diff_tx: None,
             priority: None,
@@ -4330,6 +4386,7 @@ mod tests {
             pypi_provenance: false,
             github_api_base: "https://api.github.com".to_string(),
             gitlab_api_base: "https://gitlab.com/api/v4".to_string(),
+            version_burst: VersionBurstConfig::default(),
         };
 
         prune_staging_cache(&config, &RuntimeStats::default())

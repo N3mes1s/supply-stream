@@ -1,8 +1,8 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use crate::{
-    collector::CollectConfig, deps_dev::FocusDependentsConfig, event::Ecosystem,
-    scoring::ScoreBuildConfig,
+    assessment::VersionBurstConfig, collector::CollectConfig, deps_dev::FocusDependentsConfig,
+    event::Ecosystem, scoring::ScoreBuildConfig,
 };
 
 #[derive(Debug, Clone)]
@@ -81,6 +81,9 @@ pub struct CaptureConfig {
     pub pypi_provenance: bool,
     pub github_api_base: String,
     pub gitlab_api_base: String,
+    /// Thresholds for the rapid version-burst signal computed at capture
+    /// time; see `VersionBurstConfig` for the reasoning behind the defaults.
+    pub version_burst: VersionBurstConfig,
 }
 
 #[derive(Debug, Clone)]

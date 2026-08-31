@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 use crate::{
     capture::{CapturedRelease, ReleaseStatus, captured_metadata_risk},
     content_risk::{ContentRiskMatch, ContentRiskSignal, captured_content_risk},
@@ -10,6 +12,127 @@ use crate::{
     repo_provenance::RepositoryReleaseProvenance,
     store::GraphEvidence,
 };
+
+/// Configurable thresholds for the rapid version-burst signal.
+///
+/// Threshold reasoning:
+/// - `window`: the Trinitite npm worm published 10 versions of one package
+///   across 4 major-version lines (0.5.x, 1.6.x, 2.2.x, 3.0.x) within ~20
+///   minutes from a compromised maintainer token. A 30-minute window catches
+///   that burst with margin for feed polling jitter, while staying far below
+///   any legitimate release cadence.
+/// - `min_versions`: 5 versions inside the window is already unusual for
+///   humans and CI pipelines (which publish one version per pipeline run);
+///   combined with the major-line requirement it selects exactly the
+///   mass-republish shape.
+/// - `min_major_lines`: the strong form of the signal requires >=2 distinct
+///   major-version lines in the window. Legitimate fast publishing (CI
+///   prerelease churn, monorepo bulk releases, a maintainer fixing a broken
+///   publish) almost always advances ONE version line; jumping several major
+///   lines back-to-back is the token-hijack mass-republish tell. A count-only
+///   burst on a single line therefore never escalates severity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionBurstConfig {
+    pub window_secs: u64,
+    pub min_versions: usize,
+    pub min_major_lines: usize,
+}
+
+impl Default for VersionBurstConfig {
+    fn default() -> Self {
+        Self {
+            window_secs: 1800,
+            min_versions: 5,
+            min_major_lines: 2,
+        }
+    }
+}
+
+impl VersionBurstConfig {
+    pub fn window(&self) -> chrono::Duration {
+        chrono::Duration::seconds(self.window_secs.clamp(1, i64::MAX as u64) as i64)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VersionBurstSignal {
+    pub suspicious: bool,
+    pub versions_in_window: usize,
+    pub distinct_major_lines: usize,
+    pub window_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Evaluates a rapid version-burst from the release timestamps of the same
+/// package within the configured window.
+///
+/// `timestamps` are (version, release time) pairs for the package; the
+/// candidate release itself MUST be included so the count reflects the burst
+/// as observed at assessment time. Timestamps may arrive in any order.
+pub fn evaluate_version_burst(
+    timestamps: &[(String, chrono::DateTime<chrono::Utc>)],
+    config: &VersionBurstConfig,
+) -> VersionBurstSignal {
+    let Some(&(_, latest)) = timestamps.iter().max_by(|left, right| left.1.cmp(&right.1)) else {
+        return VersionBurstSignal::default();
+    };
+    let window_start = latest - config.window();
+
+    let in_window: Vec<&str> = timestamps
+        .iter()
+        .filter(|(_, at)| *at >= window_start && *at <= latest)
+        .map(|(version, _)| version.as_str())
+        .collect();
+    let versions_in_window = in_window.len();
+    let distinct_major_lines = in_window
+        .iter()
+        .filter_map(|version| major_version_line(version))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+
+    let mut signal = VersionBurstSignal {
+        suspicious: false,
+        versions_in_window,
+        distinct_major_lines,
+        window_secs: config.window_secs,
+        reason: None,
+    };
+
+    // Escalation requires BOTH the version count and the multi-major-line
+    // spread: count-only bursts (single-line CI/monorepo publishing) are
+    // common and benign and must not escalate.
+    if versions_in_window >= config.min_versions && distinct_major_lines >= config.min_major_lines {
+        signal.suspicious = true;
+        signal.reason = Some(format!(
+            "{versions_in_window} versions of this package across {distinct_major_lines} major-version lines within {}s; rapid multi-major-line republish bursts are a mass-republish compromise shape, not a normal release cadence",
+            config.window_secs
+        ));
+    }
+    signal
+}
+
+/// Major-version line of a semver-ish version string: the leading numeric
+/// segment ("2.2.1" -> "2", "0.5.3" -> "0"). Non-numeric or missing leading
+/// segments map to `None` (excluded from the major-line spread).
+pub fn major_version_line(version: &str) -> Option<String> {
+    let head = version
+        .split(['.', '-', '+', '_'])
+        .find(|segment| !segment.is_empty())?;
+    if !head.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    Some(head.to_string())
+}
+
+pub fn captured_version_burst(capture: &CapturedRelease) -> VersionBurstSignal {
+    capture
+        .details
+        .get("version_burst")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<VersionBurstSignal>(value).ok())
+        .unwrap_or_default()
+}
 
 #[derive(Debug, Clone)]
 pub struct DiffAssessmentInput {
@@ -77,6 +200,7 @@ pub fn assess_release(
     let metadata_risk = captured_metadata_risk(capture);
     let content_risk = captured_content_risk(capture);
     let content_summary = summarize_content_matches(&content_risk);
+    let version_burst = captured_version_burst(capture);
 
     let mut factors = Vec::new();
     if repo_mismatch {
@@ -119,6 +243,9 @@ pub fn assess_release(
     if !content_risk.iocs.is_empty() {
         factors.push("content_iocs_present".to_string());
     }
+    if version_burst.suspicious {
+        factors.push("rapid_version_burst".to_string());
+    }
 
     let content_changed = diff.as_ref().is_some_and(|diff| {
         diff.files_added_count + diff.files_removed_count + diff.files_changed_count > 0
@@ -137,7 +264,6 @@ pub fn assess_release(
     if package_manifest_only {
         factors.push("package_manifest_only".to_string());
     }
-
     let (severity, verdict_class, suspicious, reason) = if content_summary.confident_malware {
         (
             ReleaseAssessmentSeverity::High,
@@ -179,6 +305,20 @@ pub fn assess_release(
             ReleaseVerdictClass::SuspiciousUnknown,
             true,
             metadata_risk.reason.clone(),
+        )
+    } else if version_burst.suspicious {
+        // The burst signal is deliberately a WARNING-level suspicious
+        // contributor, never a standalone malware verdict: legit rapid
+        // publishing exists (CI prerelease churn, monorepo bulk releases,
+        // republishing a broken release), and the multi-major-line spread
+        // only marks the release as worth a human look.
+        (
+            ReleaseAssessmentSeverity::Warning,
+            ReleaseVerdictClass::SuspiciousUnknown,
+            true,
+            version_burst.reason.clone().unwrap_or_else(|| {
+                "rapid multi-major-line version burst observed for this package".to_string()
+            }),
         )
     } else if removed_or_yanked
         && content_changed
@@ -1080,6 +1220,260 @@ mod tests {
                 .factors
                 .iter()
                 .any(|factor| factor == "install_time_execution_longstanding")
+        );
+    }
+
+    #[test]
+    fn version_burst_fires_on_cross_major_line_burst() {
+        // Trinitite shape: 10 versions across 4 major lines (0.5.x, 1.6.x,
+        // 2.2.x, 3.0.x) within ~20 minutes.
+        let base = Utc::now();
+        let timestamps = [
+            ("0.5.0", 0),
+            ("0.5.1", 60),
+            ("1.6.0", 300),
+            ("1.6.1", 360),
+            ("2.2.0", 600),
+            ("2.2.1", 660),
+            ("2.2.2", 720),
+            ("3.0.0", 900),
+            ("3.0.1", 960),
+            ("3.0.2", 1020),
+        ]
+        .into_iter()
+        .map(|(version, offset)| {
+            (
+                version.to_string(),
+                base + chrono::Duration::seconds(offset),
+            )
+        })
+        .collect::<Vec<_>>();
+
+        let signal = evaluate_version_burst(&timestamps, &VersionBurstConfig::default());
+        assert!(signal.suspicious);
+        assert_eq!(signal.versions_in_window, 10);
+        assert_eq!(signal.distinct_major_lines, 4);
+        assert!(signal.reason.is_some());
+    }
+
+    #[test]
+    fn version_burst_does_not_escalate_single_line_patch_burst() {
+        // Common benign shape: CI/monorepo publishing many patch versions of
+        // ONE major line quickly.
+        let base = Utc::now();
+        let timestamps = [
+            ("1.4.0", 0),
+            ("1.4.1", 120),
+            ("1.4.2", 240),
+            ("1.4.3", 360),
+            ("1.4.4", 480),
+            ("1.4.5", 600),
+            ("1.4.6", 720),
+        ]
+        .into_iter()
+        .map(|(version, offset)| {
+            (
+                version.to_string(),
+                base + chrono::Duration::seconds(offset),
+            )
+        })
+        .collect::<Vec<_>>();
+
+        let signal = evaluate_version_burst(&timestamps, &VersionBurstConfig::default());
+        assert!(!signal.suspicious);
+        assert_eq!(signal.versions_in_window, 7);
+        assert_eq!(signal.distinct_major_lines, 1);
+    }
+
+    #[test]
+    fn version_burst_stays_quiet_on_normal_release_cadence() {
+        // Normal cadence: a handful of releases spread over days.
+        let base = Utc::now();
+        let timestamps = [
+            ("1.0.0", 0),
+            ("1.1.0", 86_400),
+            ("1.2.0", 172_800),
+            ("2.0.0", 259_200),
+        ]
+        .into_iter()
+        .map(|(version, offset)| {
+            (
+                version.to_string(),
+                base + chrono::Duration::seconds(offset),
+            )
+        })
+        .collect::<Vec<_>>();
+
+        let signal = evaluate_version_burst(&timestamps, &VersionBurstConfig::default());
+        assert!(!signal.suspicious);
+        assert_eq!(signal.versions_in_window, 1);
+        assert_eq!(signal.distinct_major_lines, 1);
+    }
+
+    #[test]
+    fn version_burst_requires_both_count_and_major_line_spread() {
+        let base = Utc::now();
+        let at = |offset: i64| base + chrono::Duration::seconds(offset);
+
+        // Count met, but only one major line: no signal even at 9 versions.
+        let single_line = [
+            "1.0.0", "1.0.1", "1.0.2", "1.0.3", "1.0.4", "1.0.5", "1.0.6", "1.0.7", "1.0.8",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, version)| (version.to_string(), at(index as i64 * 60)))
+        .collect::<Vec<_>>();
+        assert!(!evaluate_version_burst(&single_line, &VersionBurstConfig::default()).suspicious);
+
+        // Major lines met, but only 4 versions (< default 5): no signal.
+        let few_cross_major = ["0.5.0", "1.6.0", "2.2.0", "3.0.0"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, version)| (version.to_string(), at(index as i64 * 60)))
+            .collect::<Vec<_>>();
+        let signal = evaluate_version_burst(&few_cross_major, &VersionBurstConfig::default());
+        assert!(!signal.suspicious);
+        assert_eq!(signal.versions_in_window, 4);
+        assert_eq!(signal.distinct_major_lines, 4);
+
+        // Custom thresholds are honored: with min_versions=4 the same set fires.
+        let relaxed = VersionBurstConfig {
+            window_secs: 1800,
+            min_versions: 4,
+            min_major_lines: 2,
+        };
+        assert!(evaluate_version_burst(&few_cross_major, &relaxed).suspicious);
+    }
+
+    #[test]
+    fn version_burst_ignores_prerelease_build_metadata_in_major_line() {
+        assert_eq!(major_version_line("2.2.1"), Some("2".to_string()));
+        assert_eq!(major_version_line("0.5.3-beta.1"), Some("0".to_string()));
+        assert_eq!(major_version_line("v3.0.0"), None);
+        assert_eq!(major_version_line(""), None);
+    }
+
+    #[tokio::test]
+    async fn version_burst_seeded_store_query_and_assessment_escalation() {
+        use crate::store::{EventOrigin, OperationalStore};
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let store = OperationalStore::open(crate::store::index_db_path(&data_dir))
+            .await
+            .unwrap();
+
+        // Seed the store with a cross-major burst for package "bursty" plus
+        // old releases outside the window, and a burst of a different
+        // package that must not leak into the query.
+        let now = Utc::now();
+        let seed = |package: &str, version: &str, offset_secs: i64| PackageReleaseEvent {
+            event_id: format!("npm:{package}@{version}"),
+            ecosystem: Ecosystem::Npm,
+            package: package.to_string(),
+            version: version.to_string(),
+            published_at: Some(now + chrono::Duration::seconds(offset_secs)),
+            observed_at: now + chrono::Duration::seconds(offset_secs),
+            source: "test".to_string(),
+            sequence: None,
+            package_url: None,
+            release_url: None,
+            metadata_url: None,
+            priority: Some(PrioritySnapshot::default_unknown()),
+        };
+        for (version, offset) in [
+            ("0.5.0", -600),
+            ("1.6.0", -480),
+            ("2.2.0", -360),
+            ("3.0.0", -240),
+        ] {
+            store
+                .record_event(&seed("bursty", version, offset), EventOrigin::Observed)
+                .await
+                .unwrap();
+        }
+        for (version, offset) in [("1.0.0", -600), ("1.0.1", -480)] {
+            store
+                .record_event(&seed("other", version, offset), EventOrigin::Observed)
+                .await
+                .unwrap();
+        }
+        // Old release of "bursty" outside the 30-minute window.
+        store
+            .record_event(&seed("bursty", "0.1.0", -86_400), EventOrigin::Observed)
+            .await
+            .unwrap();
+
+        let since = now - chrono::Duration::seconds(1800);
+        let times = store
+            .load_package_release_times_since(Ecosystem::Npm, "bursty", since)
+            .await
+            .unwrap();
+        assert_eq!(times.len(), 4);
+        assert!(times.iter().all(|(version, _)| version != "0.1.0"));
+
+        // The candidate release (3.0.1, published now) joins the seeded
+        // four to cross the threshold: 5 versions across 4 major lines.
+        let mut timestamps = times;
+        timestamps.push(("3.0.1".to_string(), now));
+        let burst = evaluate_version_burst(&timestamps, &VersionBurstConfig::default());
+        assert!(burst.suspicious);
+        assert_eq!(burst.versions_in_window, 5);
+        assert_eq!(burst.distinct_major_lines, 4);
+
+        // End to end: the embedded signal escalates the assessment to a
+        // WARNING-level suspicious factor, never a malware verdict.
+        let event = sample_event(PriorityTier::Low, "3.0.1");
+        let mut capture = sample_capture(false);
+        capture.details["version_burst"] = serde_json::to_value(&burst).unwrap();
+        let assessment = assess_release(&event, None, &capture, None, None);
+        assert!(assessment.suspicious);
+        assert_eq!(assessment.severity, ReleaseAssessmentSeverity::Warning);
+        assert_eq!(
+            assessment.verdict_class,
+            ReleaseVerdictClass::SuspiciousUnknown
+        );
+        assert!(
+            assessment
+                .factors
+                .iter()
+                .any(|factor| factor == "rapid_version_burst")
+        );
+    }
+
+    #[test]
+    fn version_burst_embedded_signal_round_trips_through_capture_details() {
+        let mut capture = sample_capture(false);
+        capture.details["version_burst"] = json!({
+            "suspicious": true,
+            "versions_in_window": 6,
+            "distinct_major_lines": 3,
+            "window_secs": 1800,
+            "reason": "6 versions of this package across 3 major-version lines within 1800s"
+        });
+        let signal = captured_version_burst(&capture);
+        assert!(signal.suspicious);
+        assert_eq!(signal.versions_in_window, 6);
+        assert_eq!(signal.distinct_major_lines, 3);
+    }
+
+    #[test]
+    fn assessment_without_burst_detail_stays_clean() {
+        // No version_burst detail (legacy captures, detection corpus): no
+        // factor, no escalation.
+        let event = sample_event(PriorityTier::Low, "1.2.3");
+        let capture = sample_capture(false);
+        let assessment = assess_release(&event, None, &capture, None, None);
+        assert_eq!(
+            assessment.severity,
+            ReleaseAssessmentSeverity::Informational
+        );
+        assert!(
+            !assessment
+                .factors
+                .iter()
+                .any(|factor| factor == "rapid_version_burst")
         );
     }
 

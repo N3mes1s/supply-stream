@@ -2996,3 +2996,51 @@ rule generic_self_deletion_destructive : malware destructive
         1 of ($shred, $del_all, $cipher_wipe, $xargs_shred) or
         2 of them
 }
+
+// Packed/obfuscated payloads (XOR integer tables, AES-GCM hex blobs,
+// obfuscator.io output) carry no literal IOC strings, so string rules miss
+// them. This rule matches their structural shape instead: a long flat
+// integer-array literal or a long contiguous hex blob, in the same content
+// as decode-and-execute code.
+//
+// Corpus evidence behind every threshold:
+//
+//   - The longest legitimate contiguous digit/comma run in the benign
+//     corpus is 1721 bytes (the SHA-256 constant table vendored inside
+//     swagger-ui bundles); timezone tables, prime lists, and TTF glyph
+//     data stay below that. The Trinitite-style XOR table is megabytes
+//     of flat "1,2,3,..." — three orders of magnitude past the threshold.
+//   - Legitimate contiguous hex tokens (web3 contract ABI 29.5KB, aws
+//     chunk-signing test vectors, .so binaries) are data without decode
+//     loops; none of those packages carry two decode markers.
+//   - Wholesale entropy is useless as a separator: benign colormap and
+//     OUI-table files reach 6.48 bits/byte, above anything the malicious
+//     corpus reaches. The shape is matched structurally instead.
+//   - The decode markers never appear in the benign data files that carry
+//     the blob shapes; requiring two of them in the same scanned content
+//     separates a data blob from a payload that code unpacks and runs.
+//
+// Engine note: the blob patterns are deliberately fixed-length literals.
+// yara-x cannot verify unbounded {N,} class runs over large data (the
+// FastVM scan window aborts), so {2048} is used instead of {2048,}; the
+// benign corpus tops out at 1721 anyway, and scanning a genuine packed
+// array completes well inside the 60s scan timeout.
+rule generic_packed_high_entropy_payload : suspicious obfuscation packed
+{
+    meta:
+        score = 4
+        description = "content embeds a packed payload as a long flat integer-array or contiguous hex blob together with decode-and-execute code, the XOR/AES-packed worm payload shape"
+    strings:
+        $num_array = /[\d,]{2048}/
+        $hex_blob = /[0-9a-fA-F]{2048}/
+        $xor1 = "charCodeAt(" nocase
+        $xor2 = "fromCharCode(" nocase
+        $dec1 = "atob(" nocase
+        $dec2 = "Buffer.from(" nocase
+        $dec3 = "createDecipheriv(" nocase
+        $dec4 = "eval(" nocase
+    condition:
+        filesize > 50 * 1024 and
+        1 of ($num_array, $hex_blob) and
+        2 of ($xor*, $dec*)
+}

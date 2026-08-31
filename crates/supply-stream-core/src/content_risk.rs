@@ -1184,6 +1184,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detects_packed_high_entropy_payload_rule() {
+        let temp = tempdir().unwrap();
+        // The Trinitite-style packed payload shape: a huge XOR table of
+        // comma-separated integers decoded and executed through charCodeAt
+        // and eval, with no literal IOC strings anywhere in the file.
+        let xor_table = (0..20_000)
+            .map(|index| ((index * 37 + 11) % 256).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let payload = format!(
+            "const t=[{xor_table}];const b='{blob}';const k='key';\
+             for(let i=0;i<b.length;i++)b[i]=b[i]^t[i%t.length]^k.charCodeAt(i%k.length);\
+             eval(b);",
+            blob = "QUJDREVG".repeat(2_500)
+        );
+        let archive = write_npm_archive(
+            temp.path(),
+            &[
+                (
+                    "package.json",
+                    &serde_json::to_string_pretty(&json!({
+                        "name": "packed-loader",
+                        "version": "1.0.0",
+                        "main": "index.js"
+                    }))
+                    .unwrap(),
+                ),
+                ("index.js", payload.as_str()),
+            ],
+        );
+
+        let mut capture = sample_capture(Ecosystem::Npm, "packed-loader");
+        capture.details["local_artifact"] = json!({ "path": archive });
+        let signal = scan_captured_release_inner(&reqwest::Client::new(), temp.path(), &capture)
+            .await
+            .unwrap();
+
+        assert!(
+            signal
+                .matches
+                .iter()
+                .any(|matched| matched.rule_id == "generic_packed_high_entropy_payload")
+        );
+        assert!(
+            signal
+                .factors
+                .iter()
+                .any(|factor| factor == "generic_packed_high_entropy_payload")
+        );
+        // The packed shape is a structural corroborator: on its own it never
+        // flips the signal to suspicious.
+        assert!(!signal.suspicious);
+    }
+
+    #[tokio::test]
+    async fn packed_high_entropy_payload_rule_ignores_minified_bundle() {
+        let temp = tempdir().unwrap();
+        // Ordinary minified JavaScript: one long line, high-ish entropy, but
+        // built from readable ASCII tokens. Its base64-looking runs sit
+        // between punctuation operators, never inside one quoted literal,
+        // and it carries no hex or integer-table blobs.
+        let tokens: Vec<String> = (0..40_000)
+            .map(|index| {
+                let module = index % 97;
+                format!("var a{index}=function(e{module}){{return e{module}+{index}*{module}}};")
+            })
+            .collect();
+        let minified = tokens.join("");
+        let archive = write_npm_archive(
+            temp.path(),
+            &[
+                (
+                    "package.json",
+                    &serde_json::to_string_pretty(&json!({
+                        "name": "bundled-tool",
+                        "version": "1.0.0",
+                        "main": "dist/bundle.min.js"
+                    }))
+                    .unwrap(),
+                ),
+                ("dist/bundle.min.js", minified.as_str()),
+                (
+                    "index.js",
+                    "module.exports = require('./dist/bundle.min.js');\n",
+                ),
+            ],
+        );
+
+        let mut capture = sample_capture(Ecosystem::Npm, "bundled-tool");
+        capture.details["local_artifact"] = json!({ "path": archive });
+        let signal = scan_captured_release_inner(&reqwest::Client::new(), temp.path(), &capture)
+            .await
+            .unwrap();
+
+        assert!(
+            !signal
+                .matches
+                .iter()
+                .any(|matched| matched.rule_id == "generic_packed_high_entropy_payload")
+        );
+        assert!(
+            !signal
+                .factors
+                .iter()
+                .any(|factor| factor == "generic_packed_high_entropy_payload")
+        );
+        assert!(!signal.suspicious);
+    }
+
+    #[tokio::test]
+    async fn packed_high_entropy_payload_rule_ignores_normal_source() {
+        let temp = tempdir().unwrap();
+        // Ordinary readable source: modest quoted literals, multi-line code.
+        let source = "const path = require('node:path');\n\
+                      const fs = require('node:fs');\n\
+                      function readConfig(root) {\n\
+                          const file = path.join(root, 'config.json');\n\
+                          return fs.readFileSync(file, 'utf8');\n\
+                      }\n\
+                      module.exports = { readConfig };\n";
+        let archive = write_npm_archive(
+            temp.path(),
+            &[
+                (
+                    "package.json",
+                    &serde_json::to_string_pretty(&json!({
+                        "name": "config-reader",
+                        "version": "1.0.0",
+                        "main": "index.js"
+                    }))
+                    .unwrap(),
+                ),
+                ("index.js", source),
+            ],
+        );
+
+        let mut capture = sample_capture(Ecosystem::Npm, "config-reader");
+        capture.details["local_artifact"] = json!({ "path": archive });
+        let signal = scan_captured_release_inner(&reqwest::Client::new(), temp.path(), &capture)
+            .await
+            .unwrap();
+
+        assert!(
+            !signal
+                .matches
+                .iter()
+                .any(|matched| matched.rule_id == "generic_packed_high_entropy_payload")
+        );
+        assert!(!signal.suspicious);
+    }
+
+    #[tokio::test]
     async fn detects_nyx_hidden_obfuscated_loader_rule() {
         let temp = tempdir().unwrap();
         let archive = write_npm_archive(

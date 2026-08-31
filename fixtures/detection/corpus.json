@@ -166,6 +166,22 @@
         "has_install_scripts": false,
         "gypfile": true
       }
+    },
+    {
+      "id": "packed_payload_loader",
+      "ecosystem": "npm",
+      "package": "packed-payload-loader",
+      "version": "1.0.0",
+      "format": "npm_tgz",
+      "fixture_dir": "packed-payload-loader",
+      "expected_verdict_class": "clean",
+      "expected_max_severity": "informational",
+      "required_rules": [
+        "generic_packed_high_entropy_payload"
+      ],
+      "details": {
+        "main": "index.js"
+      }
     }
   ]
 }

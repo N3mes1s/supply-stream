@@ -155,6 +155,7 @@ fn classify_rule_match(rule_id: &str) -> DetectionMatchClass {
         | "generic_git_token_patterns"
         | "generic_browser_credential_database"
         | "generic_crypto_wallet_paths"
+        | "generic_packed_high_entropy_payload"
         | "crate_ctor_auto_init_network" => DetectionMatchClass::ContextOnly,
         _ => {
             if rule_id.contains("installer") && rule_id.contains("downloader") {

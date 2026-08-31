@@ -695,6 +695,42 @@ rule pypi_build_hook_downloader : malware pypi build
         )
 }
 
+rule pypi_setup_remote_payload_exec : malware pypi build downloader loader
+{
+    meta:
+        score = 9
+        description = "PyPI setup.py build script downloads remote content and executes it dynamically via exec/eval/shell at build time, running attacker-controlled code during pip install"
+    condition:
+        pypi.is_pypi and
+        pypi.file_count("build_script") > 0 and
+        (
+            // Remote-content sources. A legitimate bootstrap downloads a
+            // prebuilt binary/wheel as a file; it does not fetch an HTTP
+            // body to interpret. `curl`/`wget` are covered by the
+            // pipe-to-shell rules and the generic archive-view rules.
+            pypi.any_file_contains("build_script", "urllib.request.urlopen(") or
+            pypi.any_file_contains("build_script", "urlopen(") or
+            pypi.any_file_contains("build_script", "requests.get(") or
+            pypi.any_file_contains("build_script", "requests.post(") or
+            pypi.any_file_contains("build_script", "httpx.")
+        ) and
+        (
+            // Dynamic-execution sinks: the fetched content (or content
+            // derived from it) runs through exec/eval/compile or a shell
+            // interpreter. subprocess with shell=True interprets an
+            // attacker-controlled command string; a benign build runs a
+            // FIXED argv (subprocess.run(["curl", ...])) or a fixed binary
+            // path after writing the download to disk.
+            pypi.any_file_contains("build_script", "exec(") or
+            pypi.any_file_contains("build_script", "eval(") or
+            pypi.any_file_contains("build_script", "os.system(") or
+            pypi.any_file_contains("build_script", "shell=True") or
+            pypi.any_file_contains("build_script", "shell = True") or
+            pypi.any_file_contains("build_script", "exec(compile(") or
+            pypi.any_file_contains("build_script", "eval(compile(")
+        )
+}
+
 rule pypi_in_memory_payload_loader : malware pypi loader generic
 {
     meta:
@@ -773,6 +809,39 @@ rule crate_build_script_downloader : malware crates build
             crate.build_rs_contains("Command::new(\"powershell\"") or
             crate.build_rs_contains("chmod") or
             crate.build_rs_contains("fs::write(")
+        )
+}
+
+rule crate_build_remote_payload_exec : malware crates build downloader loader
+{
+    meta:
+        score = 9
+        description = "Rust build.rs downloads remote content and pipes the fetched bytes into a shell interpreter or a -c command string, executing attacker-controlled code during cargo build"
+    condition:
+        crate.is_crate and
+        crate.has_build_rs and
+        (
+            // Remote-content sources: an HTTP client in the build script or
+            // an external downloader process. A legitimate build that needs
+            // a prebuilt artifact fetches it and writes it to OUT_DIR.
+            crate.build_rs_contains("reqwest::") or
+            crate.build_rs_contains("ureq::") or
+            crate.build_rs_contains("Command::new(\"curl\"") or
+            crate.build_rs_contains("Command::new(\"wget\"")
+        ) and
+        (
+            // Shell sinks with an interpret command string or a piped
+            // stdin. A downloaded file run via a fixed path (or sh with a
+            // fixed script argument) never carries -c or stdin piping.
+            crate.build_rs_contains("Command::new(\"sh\"") or
+            crate.build_rs_contains("Command::new(\"bash\"") or
+            crate.build_rs_contains("Command::new(\"/bin/sh\"") or
+            crate.build_rs_contains("Command::new(\"/bin/bash\"")
+        ) and
+        (
+            crate.build_rs_contains(".arg(\"-c\")") or
+            crate.build_rs_contains("Stdio::piped()") or
+            crate.build_rs_contains("stdin(")
         )
 }
 

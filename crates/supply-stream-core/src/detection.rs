@@ -63,6 +63,8 @@ pub fn rule_behavior_profile(rule_id: &str, rule_tags: &[String]) -> RuleBehavio
             || rule_id.contains("cloud_secret_manager_exfiltration")
             || rule_id.contains("remote_code_fetch_exec")
             || rule_id.contains("remote_payload_shell_exec")
+            || rule_id.contains("pypi_setup_remote_payload_exec")
+            || rule_id.contains("crate_build_remote_payload_exec")
             || rule_id.contains("binding_gyp_python_sandbox_escape")
             || rule_id.contains("in_memory_payload_loader")
             || rule_id.contains("build_script_env_exfil")

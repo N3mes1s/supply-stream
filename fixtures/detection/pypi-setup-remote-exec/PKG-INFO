@@ -1,0 +1,4 @@
+Metadata-Version: 2.1
+Name: pypi-setup-remote-exec
+Version: 1.0.0
+Summary: Synthetic malicious sdist fixture

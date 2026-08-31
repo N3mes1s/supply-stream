@@ -182,6 +182,45 @@
       "details": {
         "main": "index.js"
       }
+    },
+    {
+      "id": "pypi_setup_remote_exec",
+      "ecosystem": "pypi",
+      "package": "pypi-setup-remote-exec",
+      "version": "1.0.0",
+      "format": "pypi_sdist",
+      "fixture_dir": "pypi-setup-remote-exec",
+      "expected_verdict_class": "malware",
+      "expected_max_severity": "high",
+      "required_rules": [
+        "pypi_setup_remote_payload_exec",
+        "pypi_build_hook_downloader"
+      ],
+      "required_behavior_tags": [
+        "remote_fetch",
+        "dynamic_execution",
+        "install_or_build_execution"
+      ]
+    },
+    {
+      "id": "crate_build_remote_exec",
+      "ecosystem": "crates-io",
+      "package": "crate-build-remote-exec",
+      "version": "1.0.0",
+      "format": "crate",
+      "fixture_dir": "crate-build-remote-exec",
+      "expected_verdict_class": "malware",
+      "expected_max_severity": "high",
+      "required_rules": [
+        "crate_build_remote_payload_exec",
+        "crate_build_script_downloader",
+        "crate_build_script_platform_payload"
+      ],
+      "required_behavior_tags": [
+        "remote_fetch",
+        "dynamic_execution",
+        "install_or_build_execution"
+      ]
     }
   ]
 }
